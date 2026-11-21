@@ -553,8 +553,9 @@ class Bot:
         """Predict where visible mortar shells land; if one lands near us, return a move away from it."""
         me = obs["self"]
         x, y, z = me["pos"]
-        g = self.cfg["weapons"]["mortar"].get("gravity", 22.0)
-        radius = self.cfg["weapons"]["mortar"].get("splash_radius", 7.0) + 2.5
+        mortar = self.cfg.get("weapons", {}).get("mortar", {})
+        g = mortar.get("gravity", 22.0)
+        radius = mortar.get("splash_radius", 7.0) + 2.5
         best = None
         for p in obs.get("projectiles") or []:
             if p.get("kind") != "mortar":

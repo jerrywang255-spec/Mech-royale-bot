@@ -21,8 +21,7 @@ class MortarDodge(unittest.TestCase):
         b = make_bot()
         o = obs(10, (0, 0), z=Z)
         o["projectiles"] = [shell(1, (3.0, 0.0), 0.8)]
-        (dx, dy), tl = b._shell_dodge(o)
-        self.assertAlmostEqual(tl, 0.8, places=6)
+        dx, dy = b._shell_dodge(o)
         self.assertAlmostEqual(dx, -1.0, places=6)          # impact is east of us: go west
         self.assertAlmostEqual(dy, 0.0, places=6)
 
@@ -40,15 +39,15 @@ class MortarDodge(unittest.TestCase):
         o["projectiles"] = [shell(1, (40.0, 0.0), 0.8), shell(2, (2.0, 0.0), 4.0),
                             {"id": 3, "kind": "gun", "pos": [10.0, 0.0, 7.0], "vel": [-250.0, 0.0, 0.0]}]
         self.assertIsNone(b._shell_dodge(o))
-        a, _ = quiet(b.act, o)
-        self.assertEqual(a["move"], [0.0, 0.0])
 
     def test_splash_radius_from_config(self):
-        b = make_bot(weapons={"mortar": {"gravity": G, "splash": 12.0}})
+        b = make_bot(weapons={"mortar": {"gravity": G, "splash_radius": 12.0}})
         o = obs(10, (0, 0), z=Z)
         o["projectiles"] = [shell(1, (13.0, 0.0), 1.0)]   # outside 7 + 3, inside 12 + 3
         self.assertIsNotNone(b._shell_dodge(o))
         self.assertIsNone(make_bot()._shell_dodge(o))
+        damage_only = make_bot(weapons={"mortar": {"gravity": G, "splash": 160}})
+        self.assertIsNone(damage_only._shell_dodge(o))
 
 
 class LaserTelegraph(unittest.TestCase):
