@@ -62,6 +62,8 @@ class Bot:
     IGNORE_PASSIVE = True    # don't back away from mechs that aren't coming for us
     PICKUP_RANK = PICKUP_RANK
     HUNT_PASSIVE = 0.0       # if > 0: attack idle mechs in sight when HP fraction is above this
+    WANT_GUN, WANT_LASER, WANT_LIGHTNING = 95.0, 130.0, 32.0   # preferred fight ranges (m)
+    UPGRADE_ORDER = UPGRADE_ORDER
     OUTNUMBERED_HP = 1.01    # retreat below this HP fraction when 2+ threats are on us (1.01 = always)
     AIM_TOL_M = 1.8          # fire when the aim is within this many meters of the target point
     APPROACH_RANGE = 170.0   # how far out an approaching mech counts as a fight
@@ -159,6 +161,12 @@ class Bot:
                     move = self._add(move, ((gx - x) / max(d, 1e-6), (gy - y) / max(d, 1e-6)), 1.4)
                 goal_label = f"-> {gkind}"
             aim_yaw, aim_pitch, fire = self._idle_aim(obs, move)
+
+        # incoming mortar shell landing near us: step out of the blast
+        dodge = self._shell_dodge(obs)
+        if dodge is not None:
+            move = self._add(move, dodge, 3.0)
+            boost = boost or me["energy"] > 20
 
         # loot that is already within reach: take it now, whatever else we are doing
         take = self._take(obs)
@@ -530,6 +538,41 @@ class Bot:
             return None  # a wall in front of the tube: the blast would hit us
         return math.atan2(py - y, px - x), ang
 
+    def _shell_dodge(self, obs):
+        """Predict where visible mortar shells land; if one lands near us, return a move away from it."""
+        me = obs["self"]
+        x, y, z = me["pos"]
+        g = self.cfg["weapons"]["mortar"].get("gravity", 22.0)
+        radius = self.cfg["weapons"]["mortar"].get("splash_radius", 7.0) + 3.5
+        best = None
+        for p in obs.get("projectiles") or []:
+            if p.get("kind") != "mortar":
+                continue
+            px, py, pz = p["pos"]
+            vx, vy, vz = p["vel"]
+            # time until the shell is back at our height (z): pz + vz t - g t^2 / 2 = z
+            a, b, c = -0.5 * g, vz, pz - z
+            disc = b * b - 4 * a * c
+            if disc < 0:
+                continue
+            tl = (-b - math.sqrt(disc)) / (2 * a)
+            if tl <= 0 or tl > 4.0:
+                continue
+            lx, ly = px + vx * tl, py + vy * tl
+            mx, my = x + me["vel"][0] * tl, y + me["vel"][1] * tl
+            d = math.hypot(mx - lx, my - ly)
+            if d < radius and (best is None or tl < best[0]):
+                best = (tl, lx, ly, d)
+        if best is None:
+            return None
+        _, lx, ly, d = best
+        dx, dy = x - lx, y - ly
+        n = math.hypot(dx, dy)
+        if n < 0.5:
+            a = math.atan2(me["vel"][1], me["vel"][0]) + math.pi / 2
+            return (math.cos(a), math.sin(a))
+        return (dx / n, dy / n)
+
     def _strafe(self, obs, target, dist, bearing):
         """Sidestep across the line of fire and keep a good range for our weapons."""
         t = obs["t"]
@@ -537,11 +580,11 @@ class Bot:
             self.strafe_sign = -self.strafe_sign if self.rng.random() < 0.7 else self.strafe_sign
             self.strafe_until = t + self.rng.uniform(*self.STRAFE_S)
         kinds = [w["kind"] for w in obs["self"]["weapons"] if w]
-        want = 95.0
+        want = self.WANT_GUN
         if "lightning" in kinds:
-            want = 32.0
+            want = self.WANT_LIGHTNING
         if "laser" in kinds:
-            want = 130.0
+            want = self.WANT_LASER
         if target["kind"] == "mech" and "lightning" in (target.get("weapons") or []) and "lightning" not in kinds:
             want = max(want, 60.0)
         radial = max(-1.0, min(1.0, (dist - want) / want))
@@ -690,7 +733,7 @@ class Bot:
 
     def _choose_upgrade(self, offer) -> int:
         ids = [c["id"] for c in offer["choices"]]
-        for want in UPGRADE_ORDER:
+        for want in self.UPGRADE_ORDER:
             if want in ids:
                 return ids.index(want)
         return 0

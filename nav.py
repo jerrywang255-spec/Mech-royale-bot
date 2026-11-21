@@ -104,6 +104,39 @@ class Map:
             tsub = top[j0:j1 + 1, i0:i1 + 1]
             np.maximum(tsub, np.where(cover & solid_low, ptop, -1e9), out=tsub)
 
+        # fine 2 m grid for line of sight: only cells whose center is inside a building count
+        F = 2.0
+        self.fnx = int(math.ceil(self.tnx * self.tstep / F))
+        self.fny = int(math.ceil(self.tny * self.tstep / F))
+        kf = int(round(F / self.tstep))
+        padf = np.pad(heights, ((0, self.fny * kf - self.tny), (0, self.fnx * kf - self.tnx)), mode="edge")
+        ftop = padf.reshape(self.fny, kf, self.fnx, kf).max(axis=(1, 3))
+        fcx = self.minx + (np.arange(self.fnx) + 0.5) * F
+        fcy = self.miny + (np.arange(self.fny) + 0.5) * F
+        for p in world["prisms"]:
+            if p.get("kind") == "bridge":
+                continue
+            ring = p["ring"]
+            xs, ys = ring[0::2], ring[1::2]
+            i0 = max(0, int((min(xs) - self.minx) // F))
+            i1 = min(self.fnx - 1, int((max(xs) - self.minx) // F))
+            j0 = max(0, int((min(ys) - self.miny) // F))
+            j1 = min(self.fny - 1, int((max(ys) - self.miny) // F))
+            if i1 < i0 or j1 < j0:
+                continue
+            gx, gy = np.meshgrid(fcx[i0:i1 + 1], fcy[j0:j1 + 1])
+            ins = _points_in_ring(gx, gy, ring)
+            for h in p.get("holes") or []:
+                ins &= ~_points_in_ring(gx, gy, h)
+            if not ins.any():
+                continue
+            sub = ftop[j0:j1 + 1, i0:i1 + 1]
+            if float(p["base"]) - float(sub.min()) > mech_height + 0.5:
+                continue  # high overhang
+            np.maximum(sub, np.where(ins, float(p["top"]), -1e9), out=sub)
+        self.ftop = ftop.ravel().tolist()
+        self.F = F
+
         # edge of the map is a wall
         blocked[0, :] = blocked[-1, :] = True
         blocked[:, 0] = blocked[:, -1] = True
@@ -166,6 +199,25 @@ class Map:
             i = int((x - minx) // CELL)
             j = int((y - miny) // CELL)
             if 0 <= i < nx and 0 <= j < self.ny and top[j * nx + i] > a[2] + dz * f:
+                return False
+        return True
+
+    def los_fine(self, a, b, skip: float = 3.0) -> bool:
+        """Like los() but on the 2 m grid, sampled every meter: fewer false blocks near walls."""
+        dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+        d = math.hypot(dx, dy)
+        if d < 2 * skip:
+            return True
+        n = int(d)
+        top, nx, ny, minx, miny, F = self.ftop, self.fnx, self.fny, self.minx, self.miny, self.F
+        for s in range(1, n):
+            f = s / n
+            if f * d < skip or (1 - f) * d < skip:
+                continue
+            x, y = a[0] + dx * f, a[1] + dy * f
+            i = int((x - minx) // F)
+            j = int((y - miny) // F)
+            if 0 <= i < nx and 0 <= j < ny and top[j * nx + i] > a[2] + dz * f:
                 return False
         return True
 
