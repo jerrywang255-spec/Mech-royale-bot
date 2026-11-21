@@ -67,7 +67,6 @@ class Bot:
     OUTNUMBERED_HP = 1.01    # retreat below this HP fraction when 2+ threats are on us (1.01 = always)
     AIM_TOL_M = 1.8          # fire when the aim is within this many meters of the target point
     APPROACH_RANGE = 170.0   # how far out an approaching mech counts as a fight
-    NO_CHARGE_RETREAT = False  # don't charge the laser (half speed) while running away
 
     def __init__(self, hello: mf.Hello):
         self.cfg = hello["config"]
@@ -86,6 +85,7 @@ class Bot:
         self.seen = {}          # id -> last info about a mech or drone we have seen
         self.attackers = {}     # id -> last time it damaged us
         self.last_hurt = -99.0
+        self._retreating = False
         self.hurt_bearing = None
         self.heard = []         # (t, bearing, dist, kind)
         self.last_fire_t = -99.0
@@ -143,15 +143,17 @@ class Bot:
             elif mode in ("avoid", "retreat"):  # back away toward cover, keep facing them
                 move = self._add(move, (-math.cos(bearing), -math.sin(bearing)), 1.6 if mode == "retreat" else 0.9)
                 boost = mode == "retreat" and me["energy"] > 25
-            if self._laser_on_me(obs, target):
-                move = self._add(move, (-math.sin(bearing) * self.strafe_sign, math.cos(bearing) * self.strafe_sign), 2.5)
-                boost = True
+            if mode == "retreat":
+                cover = self._cover_move(obs, target)
+                if cover is not None:
+                    move = cover
+                    boost = math.hypot(*cover) > 0.05 and me["energy"] > 25
         elif self.HEAL_HOLD and hp_r < 0.85 and t - self.last_hurt < 20 and self._urgency(obs) < 0.6:
             move = (0.0, 0.0)          # stand still (silent) behind cover while health comes back
-            aim_yaw, aim_pitch, fire = self._idle_aim(obs, move)
+            aim_yaw, aim_pitch, fire = self._idle_aim(obs, move, allow_crates=False)
             goal_label = "heal"
         else:
-            goal = self._pick_goal(obs, hp_r)
+            goal = self._pick_goal(obs, hp_r, drops_only=self._retreating)
             if goal is not None:
                 gx, gy, gid, gkind = goal
                 d = math.hypot(gx - x, gy - y)
@@ -160,7 +162,13 @@ class Bot:
                 else:
                     move = self._add(move, ((gx - x) / max(d, 1e-6), (gy - y) / max(d, 1e-6)), 1.4)
                 goal_label = f"-> {gkind}"
-            aim_yaw, aim_pitch, fire = self._idle_aim(obs, move)
+            if goal is None and self._retreating and self._urgency(obs) < 0.4:
+                move = (0.0, 0.0)
+                goal_label = "heal"
+                if t - self.last_hurt < 2.5 and self.hurt_bearing is not None:
+                    move = (-math.cos(self.hurt_bearing), -math.sin(self.hurt_bearing))
+                    goal_label = "retreat"
+            aim_yaw, aim_pitch, fire = self._idle_aim(obs, move, allow_crates=not self._retreating)
 
         # loot that is already within reach: take it now, whatever else we are doing
         take = self._take(obs)
@@ -183,6 +191,14 @@ class Bot:
             boost = True
         elif urgency < 0.65 and mode != "retreat":
             boost = False
+
+        for enemy in sorted(enemies, key=lambda e: math.dist(e["pos"][:2], (x, y))):
+            if self._laser_on_me(obs, enemy):
+                bearing = math.atan2(enemy["pos"][1] - y, enemy["pos"][0] - x)
+                move = self._add(move, (-math.sin(bearing) * self.strafe_sign,
+                                        math.cos(bearing) * self.strafe_sign), 2.5)
+                boost = boost or me["energy"] > 30
+                break
 
         # Immediate blast avoidance still applies to the chosen route.
         dodge = self._shell_dodge(obs)
@@ -337,6 +353,10 @@ class Bot:
         me, t = obs["self"], obs["t"]
         pos = me["pos"]
         alive = obs.get("alive", 16)
+        if hp_r >= 0.7 or alive <= 2:
+            self._retreating = False
+        elif hp_r < self.RETREAT_HP and t - self.last_hurt < 8:
+            self._retreating = True
         best, best_score = None, 1e18
         passive = []
         if self.IGNORE_PASSIVE:
@@ -358,14 +378,12 @@ class Bot:
             d = math.dist(best["pos"][:2], pos[:2])
             e_r = self._hp_frac(best)
             attacking = t - self.attackers.get(best["id"], -99) < 4
-            recovering = getattr(self, "_retreating", False) and hp_r < 0.7
-            if (hp_r < self.RETREAT_HP or recovering) and e_r > hp_r * 0.8 and alive > 2 and d > 25:
+            if (self._retreating or hp_r < self.RETREAT_HP) and alive > 2:
                 self._retreating = True
                 return best, "retreat"
-            self._retreating = False
             if self.OUTNUMBERED_HP > 0 and len(enemies) >= 2 and hp_r < self.OUTNUMBERED_HP and alive > 2:
                 return best, "retreat"
-            if attacking or d < self.CLOSE_FIGHT or alive <= 3:
+            if (attacking and d < 120 and self._can_see(me, best)) or d < self.CLOSE_FIGHT or alive <= 3:
                 return best, "fight"
             if self.FIGHT_APPROACHING and d < self.APPROACH_RANGE and self._can_see(me, best):
                 ev = best.get("vel", [0, 0, 0])
@@ -378,6 +396,8 @@ class Bot:
             if hp_r > 0.55 and weaker and d < 120 and self._can_see(me, best):
                 return best, "fight"
             return best, "avoid"
+        if self._retreating:
+            return None, None
         # no mechs in sight: drones that shoot us, or easy cubes while it is quiet
         quiet = (not enemies) if self.IGNORE_PASSIVE else all(t - v["t"] > 6 for v in self.seen.values() if v.get("kind") == "mech")
         quiet = quiet and t - max([v for k, v in self.attackers.items() if k < 100] or [-99]) > 6
@@ -473,7 +493,7 @@ class Bot:
         l_pitch_err = abs(aim_actual[1] - l_pitch)
         yaw_err = abs(wrap(aim_actual[0] - g_yaw))
         pitch_err = abs(aim_actual[1] - g_pitch)
-        shoot = mode in ("fight", "retreat", "farm") and visible
+        shoot = mode in ("fight", "farm") and visible
 
         for i, w in enumerate(weapons):
             if not w or not shoot:
@@ -491,8 +511,6 @@ class Bot:
             elif k == "laser":
                 charge = w.get("charge", 0) or 0
                 full = s.get("charge", 0.75)
-                if mode == "retreat" and self.NO_CHARGE_RETREAT and charge <= 0:
-                    continue
                 if dist < s.get("range", 280) * 0.95 and w.get("cooldown", 0) <= 0.05:
                     if charge < full * 0.97:
                         fire[i] = True                          # keep charging
@@ -553,8 +571,9 @@ class Bot:
         """Predict where visible mortar shells land; if one lands near us, return a move away from it."""
         me = obs["self"]
         x, y, z = me["pos"]
-        g = self.cfg["weapons"]["mortar"].get("gravity", 22.0)
-        radius = self.cfg["weapons"]["mortar"].get("splash_radius", 7.0) + 2.5
+        mortar = self.cfg.get("weapons", {}).get("mortar", {})
+        g = mortar.get("gravity", 22.0)
+        radius = mortar.get("splash_radius", 7.0) + 2.5
         best = None
         for p in obs.get("projectiles") or []:
             if p.get("kind") != "mortar":
@@ -604,7 +623,7 @@ class Bot:
         return (sx + rx * 0.8, sy + ry * 0.8)
 
     # ------------------------------------------------------------------ looking around
-    def _idle_aim(self, obs, move):
+    def _idle_aim(self, obs, move, allow_crates=True):
         me, t = obs["self"], obs["t"]
         x, y = me["pos"][0], me["pos"][1]
         if t - self.last_hurt < 2.5 and self.hurt_bearing is not None:
@@ -620,7 +639,7 @@ class Bot:
             v = min(recent, key=lambda v: math.dist(v["pos"][:2], (x, y)))
             return math.atan2(v["pos"][1] - y, v["pos"][0] - x), 0.0, [False, False]
         # crates in sight while things are calm: shoot them for cubes and weapons
-        crate = self._crate_target(obs)
+        crate = self._crate_target(obs) if allow_crates else None
         if crate is not None:
             return crate
         sp = math.hypot(*move)
@@ -674,11 +693,11 @@ class Bot:
         c, r = self._zone_now(obs["zone"], obs["t"] + secs)
         return math.hypot(gx - c[0], gy - c[1]) < r - 10
 
-    def _pick_goal(self, obs, hp_r):
+    def _pick_goal(self, obs, hp_r, drops_only=False):
         """Something worth walking to while nobody is shooting: drop, weapon, cube."""
         me, t = obs["self"], obs["t"]
         x, y, z = me["pos"]
-        if self._urgency(obs) > 0.40 or hp_r < 0.40:
+        if self._urgency(obs) > 0.40:
             return None
         if self.IGNORE_PASSIVE:
             recent_mech = any(self._threat(obs, m) for m in obs["mechs"] if m["kind"] == "mech") \
@@ -688,12 +707,16 @@ class Bot:
         best, best_score = None, 1e9
         for dp in obs.get("drops") or []:
             d = math.hypot(dp["pos"][0] - x, dp["pos"][1] - y)
-            if dp.get("holder") not in (None, me["id"]) or recent_mech:
+            if (dp.get("holder") not in (None, me["id"]) or recent_mech
+                    or self.bad_goals.get(dp["id"], -1) > t
+                    or not self._in_zone_later(obs, *dp["pos"][:2], d / 10 + dp.get("capture_s", 4))):
                 continue
             if d < 150 and dp.get("lands_in", 99) < d / 11 + 6:
                 score = d * 0.6
                 if score < best_score:
                     best, best_score = (dp["pos"][0], dp["pos"][1], dp["id"], "drop"), score
+        if drops_only or hp_r < 0.40:
+            return best
         for p in obs["pickups"]:
             if self.bad_goals.get(p["id"], -1) > t or not self._wants(me, p["kind"]):
                 continue
@@ -750,6 +773,28 @@ class Bot:
         return 0
 
     # ------------------------------------------------------------------ movement
+    def _cover_move(self, obs, target):
+        if self.map is None or self._urgency(obs) >= 0.4:
+            return None
+        me = obs["self"]
+        x, y, z = me["pos"]
+        eye = me["stats"].get("eye_height", 8)
+        tx, ty, tz = target["pos"]
+        threat = (tx, ty, tz + 8)
+        if not self.map.los(threat, (x, y, z + eye)):
+            return (0.0, 0.0)
+        away = math.atan2(y - ty, x - tx)
+        for offset in (0, 1, -1, 2, -2, 3, -3, 4):
+            yaw = away + offset * TAU / 8
+            if self.map.free_dist(x, y, yaw, 14.0) < 14.0:
+                continue
+            dx, dy = math.cos(yaw), math.sin(yaw)
+            px, py = x + 12 * dx, y + 12 * dy
+            if self._in_zone_later(obs, px, py, 7) and not self.map.los(
+                    threat, (px, py, self.map.ground_at(px, py) + eye)):
+                return dx, dy
+        return None
+
     @staticmethod
     def _add(a, b, w):
         return (a[0] + b[0] * w, a[1] + b[1] * w)
