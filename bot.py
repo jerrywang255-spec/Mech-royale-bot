@@ -351,8 +351,11 @@ class Bot:
             d = math.dist(best["pos"][:2], pos[:2])
             e_r = self._hp_frac(best)
             attacking = t - self.attackers.get(best["id"], -99) < 4
-            if hp_r < self.RETREAT_HP and e_r > hp_r and alive > 2:
+            recovering = getattr(self, "_retreating", False) and hp_r < 0.7
+            if (hp_r < self.RETREAT_HP or recovering) and e_r > hp_r * 0.8 and alive > 2 and d > 25:
+                self._retreating = True
                 return best, "retreat"
+            self._retreating = False
             if self.OUTNUMBERED_HP > 0 and len(enemies) >= 2 and hp_r < self.OUTNUMBERED_HP and alive > 2:
                 return best, "retreat"
             if attacking or d < self.CLOSE_FIGHT or alive <= 3:
@@ -365,7 +368,7 @@ class Bot:
             if self.FIGHT_VISIBLE and d < 200 and self._can_see(me, best):
                 return best, "fight"
             weaker = e_r < hp_r - 0.15 or (alive <= 6 and e_r <= hp_r)
-            if hp_r > 0.55 and weaker and d < 180 and self._can_see(me, best):
+            if hp_r > 0.55 and weaker and d < 120 and self._can_see(me, best):
                 return best, "fight"
             return best, "avoid"
         # no mechs in sight: drones that shoot us, or easy cubes while it is quiet
@@ -474,7 +477,8 @@ class Bot:
                         and yaw_err < tol_yaw and pitch_err < 0.06:
                     fire[i] = True
             elif k == "lightning":
-                if dist < s.get("range", 45) * 0.92 and me["energy"] >= s.get("energy", 3) + 2 \
+                reserve = 2 if dist < 25 else 20
+                if dist < s.get("range", 45) * 0.92 and me["energy"] >= s.get("energy", 3) + reserve \
                         and abs(wrap(aim_actual[0] - direct_yaw)) < math.radians(s.get("cone_deg", 30)) * 0.4:
                     fire[i] = True
             elif k == "laser":
@@ -543,7 +547,7 @@ class Bot:
         me = obs["self"]
         x, y, z = me["pos"]
         g = self.cfg["weapons"]["mortar"].get("gravity", 22.0)
-        radius = self.cfg["weapons"]["mortar"].get("splash_radius", 7.0) + 3.5
+        radius = self.cfg["weapons"]["mortar"].get("splash_radius", 7.0) + 2.5
         best = None
         for p in obs.get("projectiles") or []:
             if p.get("kind") != "mortar":
@@ -556,7 +560,7 @@ class Bot:
             if disc < 0:
                 continue
             tl = (-b - math.sqrt(disc)) / (2 * a)
-            if tl <= 0 or tl > 4.0:
+            if tl <= 0 or tl > 2.5:
                 continue
             lx, ly = px + vx * tl, py + vy * tl
             mx, my = x + me["vel"][0] * tl, y + me["vel"][1] * tl
@@ -709,7 +713,7 @@ class Bot:
             if self.bad_goals.get(c["id"], -1) > t:
                 continue
             d = math.hypot(c["pos"][0] - x, c["pos"][1] - y)
-            if d > self.CUBE_RANGE or c["pos"][2] - z > 3 or (recent_mech and d > 25):
+            if d > self.CUBE_RANGE or c["pos"][2] - z > 3 or (recent_mech and d > 25) or (me.get("cubes", 0) >= 10 and d > 15):
                 continue
             score = d - 10
             if score < best_score:
