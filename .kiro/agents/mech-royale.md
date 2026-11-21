@@ -13,7 +13,7 @@ permissions:
     - capability: fs_read
       effect: allow
     - capability: fs_write
-      match: ["Mech-royale-bot/bot.py", "Mech-royale-bot/nav.py", "Mech-royale-bot/mechfight.py", "Mech-royale-bot/Dockerfile", "Mech-royale-bot/README.md", "Mech-royale-bot/tests/**", "Mech-royale-bot/scripts/**", "AGENTS.md", "tests/**", "docs/**", "scripts/**", ".kiro/**"]
+      match: ["bot.py", "nav.py", "mechfight.py", "Dockerfile", "README.md", "AGENTS.md", "tests/**", "docs/**", "scripts/**", ".kiro/**"]
       effect: allow
     - capability: shell
       match: ["python *", "python3 *", "py *", "docker build *", "docker run *", "git status*", "git diff *", "git log *"]

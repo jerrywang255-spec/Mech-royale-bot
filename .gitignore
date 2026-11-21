@@ -1,0 +1,8 @@
+# Keep the legacy nested checkout as a local backup, not a submission artifact.
+/Mech-royale-bot/
+
+# Python and local test artifacts.
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/

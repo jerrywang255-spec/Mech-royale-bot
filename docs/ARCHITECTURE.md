@@ -4,10 +4,10 @@ Update this file when module responsibilities or major decision flows change.
 
 ## Files
 
-- `Mech-royale-bot/bot.py`: per-tick policy. Remembers observations, chooses targets/modes, selects movement and weapons, handles loot/upgrades, and performs local steering.
-- `Mech-royale-bot/nav.py`: 4 m walkability grid, approximate 3D LOS, directional clearance, and an incremental Dijkstra field toward the next zone.
-- `Mech-royale-bot/mechfight.py`: official JSON-lines protocol wrapper. Owns stdin/stdout, latest-observation selection, exception fallback, and debug drawing.
-- `Mech-royale-bot/Dockerfile`: pinned Python/NumPy runtime and bot entry point.
+- `bot.py`: per-tick policy. Remembers observations, chooses targets/modes, selects movement and weapons, handles loot/upgrades, and performs local steering.
+- `nav.py`: 4 m walkability grid, approximate 3D LOS, directional clearance, and an incremental Dijkstra field toward the next zone.
+- `mechfight.py`: official JSON-lines protocol wrapper. Owns stdin/stdout, latest-observation selection, exception fallback, and debug drawing.
+- `Dockerfile`: pinned Python/NumPy runtime and bot entry point.
 
 ## Current decision flow
 
@@ -34,7 +34,7 @@ Update this file when module responsibilities or major decision flows change.
 - `TELEMETRY {...}` every 60 s of match time: last state, damage taken/dealt by weapon, rear damage, kills, time outside the zone, mode tick counts, observation gaps, fallbacks, and `act()` latency (p50/p99 from 1 ms buckets, max, ticks ≥ 40 ms).
 - `SUMMARY {...}` once at exit (atexit; SIGTERM exits cleanly): the same fields plus `death_window` (distinct attackers and damage by weapon in the 10 s before the last observation) and `end` (`place`, `kills`) captured by the read-only `StdinTap` around `sys.stdin`.
 - `mechfight.py` is unchanged; the tap only reads lines it passes through.
-- Tests: `Mech-royale-bot/tests/` (`python -m unittest discover -s tests`), including a subprocess JSON-lines round trip.
+- Tests: `tests/` (`python -m unittest discover -s tests`), including a subprocess JSON-lines round trip.
 
 ## Data boundaries
 
