@@ -45,6 +45,12 @@ Use one row per meaningful behavioral iteration. Record neutral and negative res
 |---|---|---|---|---|---|
 | A001 | 2026-11-20 | `4bdcb01` (local `origin/main`, not re-fetched; confirm it is the submitted commit) | No replays, stderr, per-match places, `protocol.md`, or kit in the workspace. Synthetic probes only: `python scripts/probe_baseline.py` (1 km and `--size 2048 --buildings 400 --seed 8`). | No match evidence, so no loss mechanism is measured. Code behavior on synthetic input: `act()` raises `KeyError: 'max_hp'` when an enemy omits `max_hp` (schema marks it optional); grid LOS blocks all direct fire on 2.6–2.9% of exactly clear lines (n=2185, 2505) and 8.6–10.3% when the shooter is wall-adjacent (n=39, 35); 3 enemies within 60 m at full HP gives `fight`; retreat flips to `fight` between 34% and 36% HP; mid-urgency retreat moves away from the next circle. Latency on Windows dev PC: decision-only p99 ≤ 0.4 ms, Field ticks max 34.7 ms on a 2 km arena, 0 over 50 ms. | Pull the baseline's practice stderr and placements; search for `act() failed`. |
 
+## Navigation patch
+
+- Base: `833447c`. Hypothesis: earlier zone rotation and clear-heading recovery reduce time spent outside the zone and stuck near obstacles.
+- Official checker on Windows: 300/300 on time, p99 20.6 ms, max 21.0 ms. Both focused navigation tests passed. The full suite reported 6 failures and 35 errors, matching the baseline counts.
+- Docker conformance and placement remain unmeasured.
+
 ## Recording rules
 
 - Use mean placement points and placement distribution as primary metrics; rank alone is not a controlled comparison.

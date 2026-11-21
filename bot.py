@@ -56,7 +56,7 @@ class Bot:
     STRAFE_S = (0.8, 2.2)    # seconds between sidestep direction changes
     FIGHT_BOOST = False      # boost while sidestepping in a fight
     FARM = True              # early game: hunt drones and crates for power cubes
-    FARM_UNTIL = 150.0       # seconds into the match to keep farming
+    FARM_UNTIL = 90.0        # shorten optional farming for placement-first test
     SPIN_SCAN = True         # when nothing is around, turn all the way round to spot targets
     CUBE_RANGE = 120.0       # how far to walk for a cube when it's quiet
     IGNORE_PASSIVE = True    # don't back away from mechs that aren't coming for us
@@ -162,12 +162,6 @@ class Bot:
                 goal_label = f"-> {gkind}"
             aim_yaw, aim_pitch, fire = self._idle_aim(obs, move)
 
-        # incoming mortar shell landing near us: step out of the blast
-        dodge = self._shell_dodge(obs)
-        if dodge is not None:
-            move = self._add(move, dodge, 3.0)
-            boost = boost or me["energy"] > 20
-
         # loot that is already within reach: take it now, whatever else we are doing
         take = self._take(obs)
         if take:
@@ -178,10 +172,23 @@ class Bot:
                     and gun.get("ammo", 99) < gun["stats"].get("mag", 12) * 0.5:
                 act["reload"] = True
 
-        # zone urgency can override everything
+        # In an urgent zone situation, path to safety outranks optional objectives.
         urgency = self._urgency(obs)
-        if urgency > 0.8 and me["energy"] > 15:
+        if urgency >= 0.85:
+            zone_move = self._zone_pull(obs)
+            if math.hypot(*zone_move) > 0.05:
+                move = zone_move
+        # Keep an energy reserve while the next circle is still reachable by walking.
+        if urgency > 0.80 and me["energy"] > 38:
             boost = True
+        elif urgency < 0.65 and mode != "retreat":
+            boost = False
+
+        # Immediate blast avoidance still applies to the chosen route.
+        dodge = self._shell_dodge(obs)
+        if dodge is not None:
+            move = self._add(move, dodge, 3.0)
+            boost = boost or me["energy"] > 20
 
         hide = None
         if target is not None and mode in ("retreat", "avoid"):
@@ -378,7 +385,7 @@ class Bot:
             d = math.dist(dr["pos"], pos)
             if t - self.attackers.get(dr["id"], -99) < 3:
                 return dr, ("fight" if hp_r > 0.4 else "retreat")
-            if quiet and hp_r > 0.5 and d < 140 and t < max(self.FARM_UNTIL, 300) and self._can_see(me, dr):
+            if quiet and hp_r > 0.5 and d < 140 and t < self.FARM_UNTIL and self._can_see(me, dr):
                 return dr, "farm"
         return None, None
 
@@ -671,7 +678,7 @@ class Bot:
         """Something worth walking to while nobody is shooting: drop, weapon, cube."""
         me, t = obs["self"], obs["t"]
         x, y, z = me["pos"]
-        if self._urgency(obs) > 0.75:
+        if self._urgency(obs) > 0.40 or hp_r < 0.40:
             return None
         if self.IGNORE_PASSIVE:
             recent_mech = any(self._threat(obs, m) for m in obs["mechs"] if m["kind"] == "mech") \
@@ -748,57 +755,82 @@ class Bot:
         return (a[0] + b[0] * w, a[1] + b[1] * w)
 
     def _steer(self, obs, move, mode, hide=None):
-        """Turn a wish vector into a safe move: avoid walls, stay in the zone, get unstuck."""
+        """Select an open short-horizon heading using the global route field.
+
+        Recovery uses a persistently selected open heading instead of an
+        unpredictable detour.  Field values are only used when finished.
+        """
         me, t = obs["self"], obs["t"]
         x, y, _ = me["pos"]
         mag = math.hypot(*move)
-        jump = boost = False
-
-        # stuck detection: we keep asking to move but barely go anywhere
-        if self.track_pos is None or t - self.track_t > 0.8:
-            if self.track_pos is not None and mag > 0.3 and math.dist(self.track_pos, (x, y)) < 1.2 and t > 2:
-                self.stuck_until = t + 0.9
-                self.detour = self.rng.uniform(-math.pi, math.pi)
-            self.track_pos, self.track_t = (x, y), t
-        if t < self.stuck_until:
-            jump = me.get("grounded", True)
-            boost = me["energy"] > 10
-            if self.detour is not None and mag > 0.1:
-                base = math.atan2(move[1], move[0])
-                a = base + 0.6 * math.copysign(1, wrap(self.detour))
-                return [math.cos(a), math.sin(a)], jump, boost
-
         if mag < 0.05:
-            return [0.0, 0.0], jump, boost
+            self.track_pos, self.track_t = (x, y), t
+            return [0.0, 0.0], False, False
         want = math.atan2(move[1], move[0])
+        speed = min(1.0, mag)
         if self.map is None:
-            return [math.cos(want), math.sin(want)], jump, boost
+            return [math.cos(want) * speed, math.sin(want) * speed], False, False
 
-        # score 16 headings: close to what we want, not into a wall, not out of the zone
-        c_now, r_now = self._zone_now(obs["zone"], t + 2)
+        m = self.map
+        field = self.field if self.field is not None and self.field.done else None
+        urgency = self._urgency(obs)
+        current_cost = field.value(x, y) if field is not None and urgency > 0.15 else math.inf
+        c_now, r_now = self._zone_now(obs["zone"], t + 4.0)
         inside = math.hypot(x - c_now[0], y - c_now[1]) < r_now
-        best, best_s = want, -1e9
+        # Direction scoring is intentionally cheap: 16 rays, no full replan.
+        candidates = []
         for k in range(16):
             a = want + (k if k < 8 else k - 16) * (TAU / 16)
-            s = math.cos(a - want) * 2.0
-            free = self.map.free_dist(x, y, a, 12.0)
-            if free < 4:
-                s -= 3.0
-            elif free < 8:
-                s -= 0.8
-            if inside:
-                px, py = x + math.cos(a) * 12, y + math.sin(a) * 12
-                if math.hypot(px - c_now[0], py - c_now[1]) > r_now - 3:
-                    s -= 1.5
-            if hide is not None and free >= 8:
-                px, py = x + math.cos(a) * 10, y + math.sin(a) * 10
-                if not self.map.los(hide, (px, py, self.map.ground_at(px, py) + 6.0)):
-                    s += 1.4          # this way puts a building between us and them
-            if s > best_s:
-                best, best_s = a, s
-        speed = min(1.0, mag)
-        return [math.cos(best) * speed, math.sin(best) * speed], jump, boost
+            ca, sa = math.cos(a), math.sin(a)
+            free = m.free_dist(x, y, a, 16.0)
+            px, py = x + ca * min(10.0, max(2.0, free)), y + sa * min(10.0, max(2.0, free))
+            score = 2.0 * math.cos(a - want) + 0.075 * free
+            if free < 5.0:
+                score -= 5.0
+            elif free < 9.0:
+                score -= 1.5
+            if inside and math.hypot(px - c_now[0], py - c_now[1]) > r_now - 5.0:
+                score -= 2.0 + 2.0 * urgency
+            if math.isfinite(current_cost):
+                future = field.value(px, py)
+                if math.isfinite(future):
+                    # Reward routes that make progress along the global map.
+                    score += max(-2.5, min(2.5, (current_cost - future) * 0.20)) * urgency
+            if hide is not None and free >= 8.0:
+                if not m.los(hide, (px, py, m.ground_at(px, py) + 6.0)):
+                    score += 1.0
+            candidates.append((score, free, a))
 
+        # Every ~0.9 seconds check whether the commanded travel made progress.
+        if self.track_pos is None:
+            self.track_pos, self.track_t = (x, y), t
+        elif t - self.track_t >= 0.9:
+            progress = math.dist(self.track_pos, (x, y))
+            if progress < 1.7 and mag > 0.3 and t > 2.0:
+                # For 1.3 s, bias toward an OPEN side passage that differs
+                # from the previous command. No random spin into a wall.
+                self.stuck_until = t + 1.3
+                alternatives = [c for c in candidates if c[1] >= 9.0
+                                and abs(wrap(c[2] - want)) >= 0.45]
+                if alternatives:
+                    self.detour = max(alternatives, key=lambda c: c[0] + 0.04*c[1])[2]
+                else:
+                    self.detour = None
+            self.track_pos, self.track_t = (x, y), t
+
+        if t < self.stuck_until and self.detour is not None:
+            # Revalidate the selected heading so a stale detour does not persist.
+            if m.free_dist(x, y, self.detour, 12.0) >= 7.0:
+                a = self.detour
+                return [math.cos(a) * speed, math.sin(a) * speed], False, False
+
+        score, free, a = max(candidates, key=lambda c: c[0])
+        # Jump only when local headings are actually blocked and grounded.
+        blocked = max(c[1] for c in candidates) < 6.0
+        jump = bool(blocked and me.get("grounded", False))
+        # Do not drain the energy reserve for routine stuck recovery.
+        recovery_boost = bool(blocked and urgency > 0.85 and me.get("energy", 0) > 55)
+        return [math.cos(a) * speed, math.sin(a) * speed], jump, recovery_boost
 
 if __name__ == "__main__":
     mf.run(Bot)
