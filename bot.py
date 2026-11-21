@@ -47,16 +47,16 @@ def log(*a) -> None:
 class Bot:
     name = "survivor"
     # tuning knobs (tested in the local simulator)
-    RETREAT_HP = 0.5         # back off below this fraction of HP...
-    CLOSE_FIGHT = 60.0       # ...always fight anyone this close
-    FIGHT_APPROACHING = True   # fight a mech that is walking toward us instead of avoiding it
+    RETREAT_HP = 0.7         # back off below this fraction of HP...
+    CLOSE_FIGHT = 35.0       # ...always fight anyone this close
+    FIGHT_APPROACHING = False   # fight a mech that is walking toward us instead of avoiding it
     HEAL_HOLD = False        # after a fight, stay put behind cover until healed
     LOOT_RANGE = 90.0        # how far to walk for a weapon
     FIGHT_VISIBLE = False    # fight any mech we can see (no avoiding)
     STRAFE_S = (0.8, 2.2)    # seconds between sidestep direction changes
     FIGHT_BOOST = False      # boost while sidestepping in a fight
-    FARM = True              # early game: hunt drones and crates for power cubes
-    FARM_UNTIL = 90.0        # shorten optional farming for placement-first test
+    FARM = False              # early game: hunt drones and crates for power cubes
+    FARM_UNTIL = 150.0       # seconds into the match to keep farming
     SPIN_SCAN = True         # when nothing is around, turn all the way round to spot targets
     CUBE_RANGE = 120.0       # how far to walk for a cube when it's quiet
     IGNORE_PASSIVE = True    # don't back away from mechs that aren't coming for us
@@ -67,6 +67,7 @@ class Bot:
     OUTNUMBERED_HP = 1.01    # retreat below this HP fraction when 2+ threats are on us (1.01 = always)
     AIM_TOL_M = 1.8          # fire when the aim is within this many meters of the target point
     APPROACH_RANGE = 170.0   # how far out an approaching mech counts as a fight
+    NO_CHARGE_RETREAT = False  # don't charge the laser (half speed) while running away
 
     def __init__(self, hello: mf.Hello):
         self.cfg = hello["config"]
@@ -85,7 +86,6 @@ class Bot:
         self.seen = {}          # id -> last info about a mech or drone we have seen
         self.attackers = {}     # id -> last time it damaged us
         self.last_hurt = -99.0
-        self._retreating = False
         self.hurt_bearing = None
         self.heard = []         # (t, bearing, dist, kind)
         self.last_fire_t = -99.0
@@ -143,17 +143,15 @@ class Bot:
             elif mode in ("avoid", "retreat"):  # back away toward cover, keep facing them
                 move = self._add(move, (-math.cos(bearing), -math.sin(bearing)), 1.6 if mode == "retreat" else 0.9)
                 boost = mode == "retreat" and me["energy"] > 25
-            if mode == "retreat":
-                cover = self._cover_move(obs, target)
-                if cover is not None:
-                    move = cover
-                    boost = math.hypot(*cover) > 0.05 and me["energy"] > 25
+            if self._laser_on_me(obs, target):
+                move = self._add(move, (-math.sin(bearing) * self.strafe_sign, math.cos(bearing) * self.strafe_sign), 2.5)
+                boost = True
         elif self.HEAL_HOLD and hp_r < 0.85 and t - self.last_hurt < 20 and self._urgency(obs) < 0.6:
             move = (0.0, 0.0)          # stand still (silent) behind cover while health comes back
-            aim_yaw, aim_pitch, fire = self._idle_aim(obs, move, allow_crates=False)
+            aim_yaw, aim_pitch, fire = self._idle_aim(obs, move)
             goal_label = "heal"
         else:
-            goal = self._pick_goal(obs, hp_r, drops_only=self._retreating)
+            goal = self._pick_goal(obs, hp_r)
             if goal is not None:
                 gx, gy, gid, gkind = goal
                 d = math.hypot(gx - x, gy - y)
@@ -162,13 +160,13 @@ class Bot:
                 else:
                     move = self._add(move, ((gx - x) / max(d, 1e-6), (gy - y) / max(d, 1e-6)), 1.4)
                 goal_label = f"-> {gkind}"
-            if goal is None and self._retreating and self._urgency(obs) < 0.4:
-                move = (0.0, 0.0)
-                goal_label = "heal"
-                if t - self.last_hurt < 2.5 and self.hurt_bearing is not None:
-                    move = (-math.cos(self.hurt_bearing), -math.sin(self.hurt_bearing))
-                    goal_label = "retreat"
-            aim_yaw, aim_pitch, fire = self._idle_aim(obs, move, allow_crates=not self._retreating)
+            aim_yaw, aim_pitch, fire = self._idle_aim(obs, move)
+
+        # incoming mortar shell landing near us: step out of the blast
+        dodge = self._shell_dodge(obs)
+        if dodge is not None:
+            move = self._add(move, dodge, 3.0)
+            boost = boost or me["energy"] > 20
 
         # loot that is already within reach: take it now, whatever else we are doing
         take = self._take(obs)
@@ -180,31 +178,10 @@ class Bot:
                     and gun.get("ammo", 99) < gun["stats"].get("mag", 12) * 0.5:
                 act["reload"] = True
 
-        # In an urgent zone situation, path to safety outranks optional objectives.
+        # zone urgency can override everything
         urgency = self._urgency(obs)
-        if urgency >= 0.85:
-            zone_move = self._zone_pull(obs)
-            if math.hypot(*zone_move) > 0.05:
-                move = zone_move
-        # Keep an energy reserve while the next circle is still reachable by walking.
-        if urgency > 0.80 and me["energy"] > 38:
+        if urgency > 0.8 and me["energy"] > 15:
             boost = True
-        elif urgency < 0.65 and mode != "retreat":
-            boost = False
-
-        for enemy in sorted(enemies, key=lambda e: math.dist(e["pos"][:2], (x, y))):
-            if self._laser_on_me(obs, enemy):
-                bearing = math.atan2(enemy["pos"][1] - y, enemy["pos"][0] - x)
-                move = self._add(move, (-math.sin(bearing) * self.strafe_sign,
-                                        math.cos(bearing) * self.strafe_sign), 2.5)
-                boost = boost or me["energy"] > 30
-                break
-
-        # Immediate blast avoidance still applies to the chosen route.
-        dodge = self._shell_dodge(obs)
-        if dodge is not None:
-            move = self._add(move, dodge, 3.0)
-            boost = boost or me["energy"] > 20
 
         hide = None
         if target is not None and mode in ("retreat", "avoid"):
@@ -353,10 +330,6 @@ class Bot:
         me, t = obs["self"], obs["t"]
         pos = me["pos"]
         alive = obs.get("alive", 16)
-        if hp_r >= 0.7 or alive <= 2:
-            self._retreating = False
-        elif hp_r < self.RETREAT_HP and t - self.last_hurt < 8:
-            self._retreating = True
         best, best_score = None, 1e18
         passive = []
         if self.IGNORE_PASSIVE:
@@ -378,12 +351,14 @@ class Bot:
             d = math.dist(best["pos"][:2], pos[:2])
             e_r = self._hp_frac(best)
             attacking = t - self.attackers.get(best["id"], -99) < 4
-            if (self._retreating or hp_r < self.RETREAT_HP) and alive > 2:
+            recovering = getattr(self, "_retreating", False) and hp_r < 0.7
+            if (hp_r < self.RETREAT_HP or recovering) and e_r > hp_r * 0.8 and alive > 2 and d > 25:
                 self._retreating = True
                 return best, "retreat"
+            self._retreating = False
             if self.OUTNUMBERED_HP > 0 and len(enemies) >= 2 and hp_r < self.OUTNUMBERED_HP and alive > 2:
                 return best, "retreat"
-            if (attacking and d < 120 and self._can_see(me, best)) or d < self.CLOSE_FIGHT or alive <= 3:
+            if attacking or d < self.CLOSE_FIGHT or alive <= 3:
                 return best, "fight"
             if self.FIGHT_APPROACHING and d < self.APPROACH_RANGE and self._can_see(me, best):
                 ev = best.get("vel", [0, 0, 0])
@@ -396,8 +371,6 @@ class Bot:
             if hp_r > 0.55 and weaker and d < 120 and self._can_see(me, best):
                 return best, "fight"
             return best, "avoid"
-        if self._retreating:
-            return None, None
         # no mechs in sight: drones that shoot us, or easy cubes while it is quiet
         quiet = (not enemies) if self.IGNORE_PASSIVE else all(t - v["t"] > 6 for v in self.seen.values() if v.get("kind") == "mech")
         quiet = quiet and t - max([v for k, v in self.attackers.items() if k < 100] or [-99]) > 6
@@ -405,7 +378,7 @@ class Bot:
             d = math.dist(dr["pos"], pos)
             if t - self.attackers.get(dr["id"], -99) < 3:
                 return dr, ("fight" if hp_r > 0.4 else "retreat")
-            if quiet and hp_r > 0.5 and d < 140 and t < self.FARM_UNTIL and self._can_see(me, dr):
+            if quiet and hp_r > 0.5 and d < 140 and t < max(self.FARM_UNTIL, 300) and self._can_see(me, dr):
                 return dr, "farm"
         return None, None
 
@@ -493,7 +466,7 @@ class Bot:
         l_pitch_err = abs(aim_actual[1] - l_pitch)
         yaw_err = abs(wrap(aim_actual[0] - g_yaw))
         pitch_err = abs(aim_actual[1] - g_pitch)
-        shoot = mode in ("fight", "farm") and visible
+        shoot = mode in ("fight", "retreat", "farm") and visible
 
         for i, w in enumerate(weapons):
             if not w or not shoot:
@@ -511,6 +484,8 @@ class Bot:
             elif k == "laser":
                 charge = w.get("charge", 0) or 0
                 full = s.get("charge", 0.75)
+                if mode == "retreat" and self.NO_CHARGE_RETREAT and charge <= 0:
+                    continue
                 if dist < s.get("range", 280) * 0.95 and w.get("cooldown", 0) <= 0.05:
                     if charge < full * 0.97:
                         fire[i] = True                          # keep charging
@@ -571,9 +546,8 @@ class Bot:
         """Predict where visible mortar shells land; if one lands near us, return a move away from it."""
         me = obs["self"]
         x, y, z = me["pos"]
-        mortar = self.cfg.get("weapons", {}).get("mortar", {})
-        g = mortar.get("gravity", 22.0)
-        radius = mortar.get("splash_radius", 7.0) + 2.5
+        g = self.cfg["weapons"]["mortar"].get("gravity", 22.0)
+        radius = self.cfg["weapons"]["mortar"].get("splash_radius", 7.0) + 2.5
         best = None
         for p in obs.get("projectiles") or []:
             if p.get("kind") != "mortar":
@@ -623,7 +597,7 @@ class Bot:
         return (sx + rx * 0.8, sy + ry * 0.8)
 
     # ------------------------------------------------------------------ looking around
-    def _idle_aim(self, obs, move, allow_crates=True):
+    def _idle_aim(self, obs, move):
         me, t = obs["self"], obs["t"]
         x, y = me["pos"][0], me["pos"][1]
         if t - self.last_hurt < 2.5 and self.hurt_bearing is not None:
@@ -639,7 +613,7 @@ class Bot:
             v = min(recent, key=lambda v: math.dist(v["pos"][:2], (x, y)))
             return math.atan2(v["pos"][1] - y, v["pos"][0] - x), 0.0, [False, False]
         # crates in sight while things are calm: shoot them for cubes and weapons
-        crate = self._crate_target(obs) if allow_crates else None
+        crate = self._crate_target(obs)
         if crate is not None:
             return crate
         sp = math.hypot(*move)
@@ -693,11 +667,11 @@ class Bot:
         c, r = self._zone_now(obs["zone"], obs["t"] + secs)
         return math.hypot(gx - c[0], gy - c[1]) < r - 10
 
-    def _pick_goal(self, obs, hp_r, drops_only=False):
+    def _pick_goal(self, obs, hp_r):
         """Something worth walking to while nobody is shooting: drop, weapon, cube."""
         me, t = obs["self"], obs["t"]
         x, y, z = me["pos"]
-        if self._urgency(obs) > 0.40:
+        if self._urgency(obs) > 0.75:
             return None
         if self.IGNORE_PASSIVE:
             recent_mech = any(self._threat(obs, m) for m in obs["mechs"] if m["kind"] == "mech") \
@@ -707,16 +681,12 @@ class Bot:
         best, best_score = None, 1e9
         for dp in obs.get("drops") or []:
             d = math.hypot(dp["pos"][0] - x, dp["pos"][1] - y)
-            if (dp.get("holder") not in (None, me["id"]) or recent_mech
-                    or self.bad_goals.get(dp["id"], -1) > t
-                    or not self._in_zone_later(obs, *dp["pos"][:2], d / 10 + dp.get("capture_s", 4))):
+            if dp.get("holder") not in (None, me["id"]) or recent_mech:
                 continue
             if d < 150 and dp.get("lands_in", 99) < d / 11 + 6:
                 score = d * 0.6
                 if score < best_score:
                     best, best_score = (dp["pos"][0], dp["pos"][1], dp["id"], "drop"), score
-        if drops_only or hp_r < 0.40:
-            return best
         for p in obs["pickups"]:
             if self.bad_goals.get(p["id"], -1) > t or not self._wants(me, p["kind"]):
                 continue
@@ -773,109 +743,62 @@ class Bot:
         return 0
 
     # ------------------------------------------------------------------ movement
-    def _cover_move(self, obs, target):
-        if self.map is None or self._urgency(obs) >= 0.4:
-            return None
-        me = obs["self"]
-        x, y, z = me["pos"]
-        eye = me["stats"].get("eye_height", 8)
-        tx, ty, tz = target["pos"]
-        threat = (tx, ty, tz + 8)
-        if not self.map.los(threat, (x, y, z + eye)):
-            return (0.0, 0.0)
-        away = math.atan2(y - ty, x - tx)
-        for offset in (0, 1, -1, 2, -2, 3, -3, 4):
-            yaw = away + offset * TAU / 8
-            if self.map.free_dist(x, y, yaw, 14.0) < 14.0:
-                continue
-            dx, dy = math.cos(yaw), math.sin(yaw)
-            px, py = x + 12 * dx, y + 12 * dy
-            if self._in_zone_later(obs, px, py, 7) and not self.map.los(
-                    threat, (px, py, self.map.ground_at(px, py) + eye)):
-                return dx, dy
-        return None
-
     @staticmethod
     def _add(a, b, w):
         return (a[0] + b[0] * w, a[1] + b[1] * w)
 
     def _steer(self, obs, move, mode, hide=None):
-        """Select an open short-horizon heading using the global route field.
-
-        Recovery uses a persistently selected open heading instead of an
-        unpredictable detour.  Field values are only used when finished.
-        """
+        """Turn a wish vector into a safe move: avoid walls, stay in the zone, get unstuck."""
         me, t = obs["self"], obs["t"]
         x, y, _ = me["pos"]
         mag = math.hypot(*move)
-        if mag < 0.05:
-            self.track_pos, self.track_t = (x, y), t
-            return [0.0, 0.0], False, False
-        want = math.atan2(move[1], move[0])
-        speed = min(1.0, mag)
-        if self.map is None:
-            return [math.cos(want) * speed, math.sin(want) * speed], False, False
+        jump = boost = False
 
-        m = self.map
-        field = self.field if self.field is not None and self.field.done else None
-        urgency = self._urgency(obs)
-        current_cost = field.value(x, y) if field is not None and urgency > 0.15 else math.inf
-        c_now, r_now = self._zone_now(obs["zone"], t + 4.0)
+        # stuck detection: we keep asking to move but barely go anywhere
+        if self.track_pos is None or t - self.track_t > 0.8:
+            if self.track_pos is not None and mag > 0.3 and math.dist(self.track_pos, (x, y)) < 1.2 and t > 2:
+                self.stuck_until = t + 0.9
+                self.detour = self.rng.uniform(-math.pi, math.pi)
+            self.track_pos, self.track_t = (x, y), t
+        if t < self.stuck_until:
+            jump = me.get("grounded", True)
+            boost = me["energy"] > 10
+            if self.detour is not None and mag > 0.1:
+                base = math.atan2(move[1], move[0])
+                a = base + 0.6 * math.copysign(1, wrap(self.detour))
+                return [math.cos(a), math.sin(a)], jump, boost
+
+        if mag < 0.05:
+            return [0.0, 0.0], jump, boost
+        want = math.atan2(move[1], move[0])
+        if self.map is None:
+            return [math.cos(want), math.sin(want)], jump, boost
+
+        # score 16 headings: close to what we want, not into a wall, not out of the zone
+        c_now, r_now = self._zone_now(obs["zone"], t + 2)
         inside = math.hypot(x - c_now[0], y - c_now[1]) < r_now
-        # Direction scoring is intentionally cheap: 16 rays, no full replan.
-        candidates = []
+        best, best_s = want, -1e9
         for k in range(16):
             a = want + (k if k < 8 else k - 16) * (TAU / 16)
-            ca, sa = math.cos(a), math.sin(a)
-            free = m.free_dist(x, y, a, 16.0)
-            px, py = x + ca * min(10.0, max(2.0, free)), y + sa * min(10.0, max(2.0, free))
-            score = 2.0 * math.cos(a - want) + 0.075 * free
-            if free < 5.0:
-                score -= 5.0
-            elif free < 9.0:
-                score -= 1.5
-            if inside and math.hypot(px - c_now[0], py - c_now[1]) > r_now - 5.0:
-                score -= 2.0 + 2.0 * urgency
-            if math.isfinite(current_cost):
-                future = field.value(px, py)
-                if math.isfinite(future):
-                    # Reward routes that make progress along the global map.
-                    score += max(-2.5, min(2.5, (current_cost - future) * 0.20)) * urgency
-            if hide is not None and free >= 8.0:
-                if not m.los(hide, (px, py, m.ground_at(px, py) + 6.0)):
-                    score += 1.0
-            candidates.append((score, free, a))
+            s = math.cos(a - want) * 2.0
+            free = self.map.free_dist(x, y, a, 12.0)
+            if free < 4:
+                s -= 3.0
+            elif free < 8:
+                s -= 0.8
+            if inside:
+                px, py = x + math.cos(a) * 12, y + math.sin(a) * 12
+                if math.hypot(px - c_now[0], py - c_now[1]) > r_now - 3:
+                    s -= 1.5
+            if hide is not None and free >= 8:
+                px, py = x + math.cos(a) * 10, y + math.sin(a) * 10
+                if not self.map.los(hide, (px, py, self.map.ground_at(px, py) + 6.0)):
+                    s += 1.4          # this way puts a building between us and them
+            if s > best_s:
+                best, best_s = a, s
+        speed = min(1.0, mag)
+        return [math.cos(best) * speed, math.sin(best) * speed], jump, boost
 
-        # Every ~0.9 seconds check whether the commanded travel made progress.
-        if self.track_pos is None:
-            self.track_pos, self.track_t = (x, y), t
-        elif t - self.track_t >= 0.9:
-            progress = math.dist(self.track_pos, (x, y))
-            if progress < 1.7 and mag > 0.3 and t > 2.0:
-                # For 1.3 s, bias toward an OPEN side passage that differs
-                # from the previous command. No random spin into a wall.
-                self.stuck_until = t + 1.3
-                alternatives = [c for c in candidates if c[1] >= 9.0
-                                and abs(wrap(c[2] - want)) >= 0.45]
-                if alternatives:
-                    self.detour = max(alternatives, key=lambda c: c[0] + 0.04*c[1])[2]
-                else:
-                    self.detour = None
-            self.track_pos, self.track_t = (x, y), t
-
-        if t < self.stuck_until and self.detour is not None:
-            # Revalidate the selected heading so a stale detour does not persist.
-            if m.free_dist(x, y, self.detour, 12.0) >= 7.0:
-                a = self.detour
-                return [math.cos(a) * speed, math.sin(a) * speed], False, False
-
-        score, free, a = max(candidates, key=lambda c: c[0])
-        # Jump only when local headings are actually blocked and grounded.
-        blocked = max(c[1] for c in candidates) < 6.0
-        jump = bool(blocked and me.get("grounded", False))
-        # Do not drain the energy reserve for routine stuck recovery.
-        recovery_boost = bool(blocked and urgency > 0.85 and me.get("energy", 0) > 55)
-        return [math.cos(a) * speed, math.sin(a) * speed], jump, recovery_boost
 
 if __name__ == "__main__":
     mf.run(Bot)
