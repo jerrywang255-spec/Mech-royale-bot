@@ -161,3 +161,9 @@ Neither the exposure delta (19 → 22 of 1,212) nor the 0 → 0 simulated-outcom
 - Include official-check status and p95/p99 action latency for candidates.
 - Mark unsupported outcomes as inconclusive rather than improvements.
 - Link the exact commit used for every submitted score and keep that commit publicly fetchable.
+
+## Zone-field initialization, 2026-11-21
+
+Hypothesis: scanning every goal cell in Python and expanding already-settled interior cells wastes time on zone changes. Compute the seed mask with NumPy and enqueue only cells close enough to the circle boundary to reach an outside neighbor.
+
+On the official arena with a 228 m seed radius (100 measured initializations after warm-up), median/p95 construction time fell from 2.70/2.90 ms to 0.37/0.41 ms. All 48,508 final cell distances matched the original for each of seven zone and edge cases. The Windows official checker passed before and after, with 300/300 on time in both; p99/max 20.6/20.6 ms before and 20.8/21.0 ms after. The candidate added one passing field regression test. Both versions had the same 14 failures and 25 errors in the existing suite. Container timing and practice placement remain unmeasured.

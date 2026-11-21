@@ -150,6 +150,7 @@ class Map:
         cost = np.where(rough, 3.0, 1.0) * np.where(near & ~blocked, 1.6, 1.0)
 
         # plain Python lists: much faster than numpy for one-element lookups
+        self.blocked_grid = blocked
         self.blocked = blocked.ravel().tolist()
         self.top = top.ravel().tolist()
         self.ground = ground.ravel().tolist()
@@ -252,23 +253,36 @@ class Field:
         r = max(radius, CELL)
         i0, i1 = int((gx - r - m.minx) // CELL), int((gx + r - m.minx) // CELL)
         j0, j1 = int((gy - r - m.miny) // CELL), int((gy + r - m.miny) // CELL)
-        best, bestd = -1, INF
-        for j in range(max(j0, 0), min(j1, m.ny - 1) + 1):
-            for i in range(max(i0, 0), min(i1, m.nx - 1) + 1):
-                c = j * m.nx + i
-                if m.blocked[c]:
-                    continue
-                x, y = m.center(c)
-                dd = math.hypot(x - gx, y - gy)
-                if dd <= r:
-                    self.dist[c] = 0.0
-                    self.heap.append((0.0, c))
-                if dd < bestd:
-                    best, bestd = c, dd
-        if not self.heap and best >= 0:
-            self.dist[best] = 0.0
-            self.heap.append((0.0, best))
-        heapq.heapify(self.heap)
+        i0, i1 = max(0, i0), min(m.nx - 1, i1)
+        j0, j1 = max(0, j0), min(m.ny - 1, j1)
+        if i0 > i1 or j0 > j1:
+            return
+
+        xs = m.minx + (np.arange(i0, i1 + 1) + 0.5) * CELL
+        ys = m.miny + (np.arange(j0, j1 + 1) + 0.5) * CELL
+        distances = np.hypot(xs - gx, (ys - gy)[:, None])
+        distances[m.blocked_grid[j0:j1 + 1, i0:i1 + 1]] = INF
+        inside = distances <= r
+        rows, cols = np.nonzero(inside)
+        if not len(rows):
+            # A small goal can miss every walkable center. Preserve the nearest
+            # walkable cell in the original search box (row-major tie break).
+            row, col = np.unravel_index(distances.argmin(), distances.shape)
+            if np.isfinite(distances[row, col]):
+                cell = int((row + j0) * m.nx + col + i0)
+                self.dist[cell] = 0.0
+                self.heap.append((0.0, cell))
+            return
+
+        for cell in ((rows + j0) * m.nx + cols + i0).tolist():
+            self.dist[cell] = 0.0
+
+        # Only seeds within one diagonal step of the perimeter can relax
+        # an outside cell. Interior seeds already have their final distance.
+        edge = inside & (distances >= r - math.sqrt(2) * CELL)
+        rows, cols = np.nonzero(edge)
+        cells = ((rows + j0) * m.nx + cols + i0).tolist()
+        self.heap = [(0.0, cell) for cell in cells]  # row-major, already a heap
 
     def step(self, budget_s: float) -> None:
         if self.done:
