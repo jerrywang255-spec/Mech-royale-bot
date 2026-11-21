@@ -30,6 +30,7 @@ Use one row per meaningful behavioral iteration. Record neutral and negative res
 | E006 | 2026-11-20 | `871d979` → `6f65505` | Zone-safety audit: `_urgency` is 0 inside the next circle's seed radius (60% of radius, or 50%/≥ 6 m when radius ≤ 40 m), and `_camp` then drifts to the nearest wall within 22 m without checking that the wall is inside the next circle. In small late circles that walks the bot out of the circle that is about to close. | `bot.py`: `_camp` only accepts a wall whose foot is `CAMP_MARGIN` = 6 m inside `next_radius`; otherwise stay still. Tests: `tests/test_zone.py` (4; 3 fail on `871d979`, 1 large-circle preserved-behavior test passes on both). | Compile PASS. Unit 41/41 PASS. Latency (host) p50 0.19 / p95 20.29 / p99 20.58 / max 23.16 ms. Official check NOT RUN. Matches NOT RUN. | None | Keep (zone correctness). Small expected effect; only small circles change. |
 | E007 | 2026-11-20 | `6f65505` → `b1ac576` | `obs.projectiles` and `obs.beams` were never read; the laser telegraph sidestep covered only the selected target. Predictable damage (mortar splash, charged lasers from a second enemy) is avoidable. | `bot.py`: `_shell_dodge()` predicts each mortar shell's impact (gravity from `config.weapons.mortar.gravity`, ground = our height) and, if it lands within 2.5 s and splash + 3 m (splash key guessed: `splash`/`splash_radius`/`blast_radius`/`radius`, default 7 m), moves away (weight 3 under 1.2 s, else 2) and boosts. Laser sidestep loops over all visible mechs. CONFIG line now includes `weapons` so the real key names show up in stderr. Tests: `tests/test_evasion.py` (6). | Compile PASS. Unit 47/47 PASS. Latency (host) p50 0.18 / p95 20.29 / p99 20.50 / max 22.45 ms. Official check NOT RUN. Matches NOT RUN. | None | Keep pending match evidence. Risks: wrong splash key → 7 m default; flat-ground impact estimate on slopes/roofs; dodge can briefly fight the zone pull. |
 | E002b | 2026-11-20 | `b1ac576` → `7ed901b` | Replaying a whole match through stdin at once showed SUMMARY `end` = null: the wrapper's reader thread can see `end` before the bot is constructed. | `bot.py`: `StdinTap` stores `end` in module state; `_final_summary` attaches it. Tests: +1 in `tests/test_telemetry.py`. Tools: `scripts/summarize_stderr.py` (aggregates SUMMARY lines: placement points mean/sd/se, distribution, damage by source, death-window attackers, zone time, latency, fallbacks, mode share), `scripts/fake_match_stderr.py` (paced scripted matches to exercise the pipeline; not a simulator). | Compile PASS. Unit 48/48 PASS. Pipeline run on 3 fake matches PASS (SUMMARY parsed in 3/3; values are fake). Official check NOT RUN. | None | Keep (instrumentation fix). |
+| E008 | 2026-11-21 | workspace `bot.py` SHA-256 `97bce237…` (lineage of the navigation patch, not E001–E007; git not readable from the agent session) → uncommitted working tree | Losing exchanges end lives: at ≥ 50% HP the bot fights any attacker however the trade goes; with the attacker out of `obs.mechs` it makes no defensive move; retreat walks straight away in the open. Breaking line of sight to reach the 5 s regeneration delay should lengthen those lives. | `bot.py`: cover episode (`_cover_update`, `_find_cover`, `_hidden`, `_cover_zone_ok`, `_cover_move`, `_end_cover`), `COVER*` knobs, `SURVIVOR_COVER` env switch, `COVER`/`LAST` stderr lines. Tests: `tests/test_cover.py` (20 incl. JSON-lines round trip). Tools: `scripts/exchange_sim.py`, `scripts/bench_cover.py`, `scripts/compare_runs.py`; `scripts/bench_act.py` fixed (config lacked `weapons`, so every baseline `act()` raised and timings were meaningless). | Compile PASS. `test_cover` 20/20 PASS; full suite 70 run, 43 fail/error = the same 43 as baseline. Host latency PASS (see E008 details). Harness: +2.52 s mean life per losing exchange (SE 0.44, 200 fresh pairs). Docker build / official check NOT RUN. Real matches NOT RUN. | None (no runner) | Keep behind the switch; submit only after a paired runner comparison (see E008 details). |
 
 ## Candidate status (2026-11-20)
 
@@ -50,6 +51,55 @@ Use one row per meaningful behavioral iteration. Record neutral and negative res
 - Base: `833447c`. Hypothesis: earlier zone rotation and clear-heading recovery reduce time spent outside the zone and stuck near obstacles.
 - Official checker on Windows: 300/300 on time, p99 20.6 ms, max 21.0 ms. Both focused navigation tests passed. The full suite reported 6 failures and 35 errors, matching the baseline counts.
 - Docker conformance and placement remain unmeasured.
+
+## E008 details: break a losing exchange (2026-11-21)
+
+**Reference.** Official best practice score 3.38 (user-reported; mean place ≈ 12.62). The commit behind it is not recorded here. Local baseline = workspace `bot.py` before E008 (SHA-256 `97BCE23787D380B71C128F81D69C10D353A3E487604EE1F46E26B152CAA69E3A`). No local number below is comparable to 3.38.
+
+**Evidence available.** No replays, match stderr, kit (`protocol.md`, `check/check.py`, `arena/`), Docker or match runner on this machine. The 10 PM exhibition notes (free-for-all, Team A absent) suggested the hypothesis: AT regained ≈ 420 armor in 20 s beside a long wall with zero damage dealt, and lost ≈ 880 armor in 11 s in a narrow lane without offensive progress. They don't show what AT sensed or why.
+
+**Code-derived failure (verified by reading `_decide`/`act`).** (1) `attacking or d < 60` → `fight` at any HP ≥ 50%, whatever the exchange; (2) attacker missing from `obs.mechs` → `_decide` returns `None` → camp/loot movement while being hit; (3) `retreat` = move directly away with a +1.0 per-heading hide bonus, no destination that breaks LOS.
+
+**Harness.** `scripts/exchange_sim.py`: the real `Bot.act()` against 1–3 scripted hunters (shared knowledge of our position every 3 s, exact box LOS, 120° FOV, assumed regen 45 HP/s after 5 s) on random 512 m box-building arenas, 45 s per episode. Scenarios: `outgunned1` (1 accurate shooter), `squad3` (3 hunters), `winning1` (control: we out-damage one enemy), `rotate2` (2 hunters during a zone move). It measures time alive and exposure under invented rules, not placement. Reproduce: `python scripts/exchange_sim.py --variant base=bot.py:COVER=0 --variant cover=bot.py --seeds 200-249` (about 3 minutes for two variants on this host).
+
+**A002, baseline classification (harness, seeds 200–249).** 108 deaths. In the last 5 s: 72% of ticks in `retreat`, 78% exposed to a shooter, 16% firing, 52 m moved, HP 0.23 at −5 s; 103/108 died within 10 s of entering retreat. Pattern: retreating in the open until caught. Exposure-grid check: `_hidden` says hidden for 3,786 random spot/shooter pairs; exact geometry sees 7 of them (0.2%).
+
+**Development (seeds 0–19).** First version: 97 of 110 episodes ended `exposed` within ~1 s (spots hidden from the shooter's current position only). Added a ±10 m flank margin and re-pick on hits at the spot; `COVER_RETRY_S` 4 → 1 s after a failed spot (paired +2.69 → +3.34 s on dev seeds). Held-out seeds 100–149 then exposed a stall bug (outgunned1/135: 5 s stuck against a wall, re-picking the same heading), fixed by excluding the stalled heading and ending after a second stall. Final comparison on unused seeds 200–249.
+
+| Harness, 50 seeds × scenario | base: survived / mean life | cover: survived / mean life | paired Δ life (SE) | better/tied/worse | survival gained/lost | Δ damage taken |
+|---|---|---|---:|---|---|---:|
+| outgunned1 | 34 / 42.6 s | 43 / 44.7 s | +2.10 s (0.69) | 15/29/6 | 15/6 | −11.7% max HP |
+| squad3 | 0 / 22.5 s | 0 / 27.0 s | +4.53 s (1.19) | 30/10/10 | 0/0 | +0.5% |
+| winning1 (control) | 50 / 45.0 s | 50 / 45.0 s | 0.00 | 0/50/0 | 0/0 | 0 (0 cover starts, kills 43 = 43) |
+| rotate2 | 8 / 33.4 s | 13 / 36.9 s | +3.45 s (0.98) | 30/11/9 | 6/1 | −3.0% |
+| all 200 pairs | 92 / 35.9 s | 106 / 38.4 s | +2.52 s (0.44) | 75/100/25 | 21/7 | −3.6% |
+
+- Switch check: `COVER=0` vs the untouched baseline file: 199/200 identical; the one differing `rotate2` pair comes from time-budgeted zone-Field growth (seeds 100–149: 196/200 identical). That is the run-to-run noise floor.
+- Pre-fix version on seeds 100–149: +2.33 s (SE 0.39), 87/91/22, survival 28/3.
+- Diagnostics (cover, 200–249): 358 episodes; ends `exposed` 327, `stuck` 17, `healed` 13, `zone` 1. HP 0.51 at start (mean over all episodes, including re-tries), 0.52 on first arrival after 1.2 s (n 318); 40 never arrived. Deaths within 10 s of entering retreat/cover: 91/94 (base 103/108). Zone damage 0 in every run, every variant.
+- Worst regressions: rotate2/225 45.0 → 32.3 s, squad3/202 36.9 → 25.3 s, squad3/213 31.6 → 22.0 s. In the traced case (squad3/130, pre-fix) a spot hidden from the known shooters was seen by another squad member en route; no full-cover spot existed afterwards and the bot fell back to open-ground retreat from a worse position. Five of the six lost `outgunned1` survivals died at 42–44.6 s of the 45 s window.
+
+**Latency (Windows host, Python 3.14.5, NumPy 2.5.1; not the 1-CPU container).**
+
+- `python scripts/bench_act.py --ticks 6000 --arena-dir %TEMP%\mr_bench_act_arena`. Candidate: p50 0.20, p95 0.54, p99 20.25, max 38.16 ms, 0 ticks > 40 ms. Baseline: p50 0.21, p95 0.51, p99 20.25, max 39.69 ms, 0 > 40 ms. An earlier pair on the same host gave candidate max 44.72 and baseline max 42.03 ms, one tick > 40 ms each, so the host is noisy. Use `--arena-dir` where temp dirs can't be deleted.
+- `python scripts/bench_cover.py --trials 400`: trigger ticks p99 21.05, max 22.14 ms; `_find_cover` alone p50 3.55, p95 6.16, p99 7.71, max 10.15 ms. Same-tick zone change: the search defers (0 starts). Those ticks still reach p99 48.6, max 67.0 ms because `nav.Field.__init__` is unbudgeted. The baseline shows the same spike (p99 50.3–61.7, max 52.5–66.9 ms across runs). This is a pre-existing deadline risk on large next circles.
+
+**Status.** Compile PASS. `tests/test_cover.py` 20/20 PASS. Full suite: 70 run, 43 fail/error, the same 43 as baseline (older tests target the E001–E007 lineage). Docker build NOT RUN, official `check/check.py` NOT RUN, real or practice matches NOT RUN. **Not submission-ready.**
+
+**Exact comparison to run when a runner is available.** Build one image and toggle with the env var, so both arms run identical code. If the scorer can't pass env vars, use two images, one built from a copy with `COVER = False`.
+
+```powershell
+docker build -t survivor:e008 .
+# per match key (same seed, slot, opponents): run both arms
+docker run --rm -i --network none --cpus 1 --memory 512m --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 -e SURVIVOR_COVER=0 -v "<arena>:/arena:ro" survivor:e008 2> base\<match>.txt
+docker run --rm -i --network none --cpus 1 --memory 512m --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 -e SURVIVOR_COVER=1 -v "<arena>:/arena:ro" survivor:e008 2> cover\<match>.txt
+# runs.csv: match,variant,place,stderr   (variant base|cover)
+python scripts/compare_runs.py runs.csv --ref base --cand cover
+```
+
+Use ≥ 48 paired practice matches (one practice set). Keep the candidate only if mean placement points improve with the paired SE well below the gain. Also check that eliminations within 10 s of a cover start fall and that no zone deaths appear; inspect the worst five regressions. Check the official checker and container latency first.
+
+**Next experiment (one at a time).** `exposed` ends 91% of episodes and `squad3` survival stays 0/50: when no spot hides from every shooter, move to the reachable spot visible to the fewest of them (partial cover). Separately, budget `Field.__init__` (pre-existing > 50 ms ticks on large circles).
 
 ## Recording rules
 

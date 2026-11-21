@@ -12,7 +12,9 @@ finish well inside 50 ms on 1 CPU, so the heavy map work happens a slice at a ti
 """
 from __future__ import annotations
 
+import atexit
 import math
+import os
 import random
 import sys
 import time
@@ -44,6 +46,15 @@ def log(*a) -> None:
     print(*a, file=sys.stderr, flush=True)
 
 
+_LAST: dict = {}     # last observation seen; logged once at exit so match logs show when we went down
+
+
+@atexit.register
+def _log_last() -> None:
+    if _LAST:
+        log("LAST " + " ".join(f"{k}={v}" for k, v in _LAST.items()))
+
+
 class Bot:
     name = "survivor"
     # tuning knobs (tested in the local simulator)
@@ -68,12 +79,33 @@ class Bot:
     AIM_TOL_M = 1.8          # fire when the aim is within this many meters of the target point
     APPROACH_RANGE = 170.0   # how far out an approaching mech counts as a fight
     NO_CHARGE_RETREAT = False  # don't charge the laser (half speed) while running away
+    # Break a losing exchange: when mech fire keeps landing on us and our fire is not landing back,
+    # walk (boosting) to a reachable spot that no known shooter can see, hide there until regeneration
+    # has started, then resume normal play. SURVIVOR_COVER=0 (or COVER = False) restores old behavior.
+    COVER = os.environ.get("SURVIVOR_COVER", "1") != "0"
+    COVER_WINDOW_S = 3.0     # look-back for "losing": mech damage taken vs. damage dealt to mechs
+    COVER_TAKEN = 0.10       # start when we took >= this fraction of max HP in the window...
+    COVER_RATIO = 0.5        # ...and dealt less than this fraction of what we took
+    COVER_FINISH_HP = 0.25   # but keep fighting a lone visible threat this weak (if we are >= 30%)
+    COVER_QUIET_S = 5.0      # leave healed only after this long without mech damage (regen running)
+    COVER_EXIT_HP = 0.9      # ...and at least this HP fraction
+    COVER_MAX_S = 25.0       # hard cap on one episode
+    COVER_COOLDOWN_S = 4.0   # no new episode this soon after one ends (prevents oscillation)
+    COVER_RETRY_S = 1.0      # ...or this soon after the spot was seen or unreachable (still losing)
+    COVER_START_URGENCY = 0.5  # never start with this much zone pressure...
+    COVER_END_URGENCY = 0.7    # ...and give up the spot once the zone needs us this much
+    COVER_FLANK_M = 10.0     # a new spot must also be hidden from each shooter stepped this far sideways
+    COVER_REPICKS = 6        # new spots per episode when the current one is seen or unreachable
 
     def __init__(self, hello: mf.Hello):
         self.cfg = hello["config"]
         self.rng = random.Random(hello.get("seed", 0))
         self.me_id = hello.get("slot", -1)
         mech = self.cfg["mech"]
+        try:  # once: the real regeneration/boost numbers, to check the cover timing assumptions
+            log("CONFIG mech " + " ".join(f"{k}={v}" for k, v in sorted(mech.items())))
+        except Exception:
+            pass
         self.map = None
         if Map is not None:
             try:
@@ -99,6 +131,12 @@ class Bot:
         self.scan = 0.0
         self.laser_wait = 0.0
         self.props = {}         # id -> (kind, x, y, z, t_seen): drones and crates we have seen
+        self.cover = None       # active cover episode (dict) or None
+        self.cov_taken = []     # (t, amount): damage from mechs inside COVER_WINDOW_S
+        self.cov_dealt = []     # (t, amount): our hits on mechs inside COVER_WINDOW_S
+        self.hit_from = {}      # attacker id -> (t, bearing) of its last hit on us
+        self.cover_next = 0.0   # no new cover episode before this match time
+        self.last_mech_hit = -99.0
 
     # ------------------------------------------------------------------ main loop
     def act(self, obs: mf.Observation) -> mf.Action:
@@ -120,6 +158,16 @@ class Bot:
         drones = [m for m in obs["mechs"] if m["kind"] == "npc"]
         hp_r = me.get("hp", 1) / max(me.get("max_hp") or 1, 1)
         target, mode = self._decide(obs, enemies, drones, hp_r)
+        _LAST.update(t=t, hp=round(me.get("hp", 0)), hp_r=round(hp_r, 2), alive=obs.get("alive"),
+                     mode=mode, cover=self.cover is not None)
+        cover = None
+        if self.COVER:
+            try:
+                # cover searches get what is left of a 14 ms slice (a fresh zone Field may have used it all)
+                cover = self._cover_update(obs, enemies, hp_r, 0.014 - (time.perf_counter() - t0))
+            except Exception as e:  # never let the optional cover logic break a tick
+                self.COVER, self.cover, cover = False, None, None
+                log(f"cover disabled after error: {e!r}")
 
         move = self._zone_pull(obs)              # (vx, vy) weighted
         boost = False
@@ -182,13 +230,29 @@ class Bot:
         urgency = self._urgency(obs)
         if urgency > 0.8 and me["energy"] > 15:
             boost = True
+        elif urgency < 0.65 and mode != "retreat":
+            boost = False
+        if cover is not None:
+            move, boost, fire, aim_yaw, aim_pitch = self._cover_move(obs, cover, target, fire, aim_yaw, aim_pitch)
+            goal_label = "cover"
+
+        # Immediate blast avoidance still applies to the chosen route.
+        dodge = self._shell_dodge(obs)
+        if dodge is not None:
+            move = self._add(move, dodge, 3.0)
+            boost = boost or me["energy"] > 20
 
         hide = None
         if target is not None and mode in ("retreat", "avoid"):
             tp = target["pos"]
             hide = (tp[0], tp[1], tp[2] + 8.0)
-        mv, jump, boost2 = self._steer(obs, move, mode, hide)
-        boost = boost or boost2
+        if cover is not None:
+            # the cover spot was chosen as straight-line reachable, so walk the line (no wall-shy steering)
+            n = math.hypot(*move)
+            mv, jump = ([move[0] / n, move[1] / n] if n > 1 else [move[0], move[1]]), False
+        else:
+            mv, jump, boost2 = self._steer(obs, move, mode, hide)
+            boost = boost or boost2
         act.update(move=mv, boost=boost, jump=jump,
                    aim=[aim_yaw if aim_yaw is not None else me["aim"][0], aim_pitch],
                    fire=fire)
@@ -419,6 +483,240 @@ class Bot:
         me = obs["self"]["pos"]
         b = math.atan2(me[1] - enemy["pos"][1], me[0] - enemy["pos"][0])
         return abs(wrap(enemy["aim"][0] - b)) < 0.15
+
+    # ------------------------------------------------------------------ cover (break a losing exchange)
+    def _is_prop(self, ident) -> bool:
+        """Is this id a drone or a crate (so a hit on it is not return fire on a mech)?"""
+        p = self.props.get(ident)
+        s = self.seen.get(ident)
+        return (p is not None and p[0] in ("npc", "crate")) or (s is not None and s.get("kind") == "npc")
+
+    def _cover_threats(self, obs, enemies):
+        """Up to 3 nearest shooter positions: visible threats, then recent attackers from memory or hit bearing."""
+        t, me = obs["t"], obs["self"]["pos"]
+        pts = {}
+        for e in enemies:
+            if self._threat(obs, e):
+                pts[e["id"]] = tuple(e["pos"])
+        for by, (ts, bearing) in self.hit_from.items():
+            if by in pts or t - ts > 6.0:
+                continue
+            s = self.seen.get(by)
+            if s is not None and t - s["t"] < 6.0:
+                pts[by] = tuple(s["pos"])
+            elif bearing is not None:     # never seen: assume a mid-range shooter along the hit bearing
+                pts[by] = (me[0] + math.cos(bearing) * 100.0, me[1] + math.sin(bearing) * 100.0, me[2])
+        return sorted(pts.values(), key=lambda p: math.dist(p[:2], me[:2]))[:3]
+
+    def _hidden(self, obs, px, py, threats, offsets=(0.0, 2.5, -2.5), flank=0.0) -> bool:
+        """No threat eye sees our upper body at (px, py), including +-2.5 m to the side (fine grid).
+        With flank > 0, also from each threat stepped `flank` meters sideways (it will not stand still)."""
+        m, st = self.map, obs["self"]["stats"]
+        eye, body = st.get("eye_height", 8.0), st.get("height", 9.0) - 1.5
+        gz = m.ground_at(px, py) + body
+        for tx, ty, tz in threats:
+            dx, dy = px - tx, py - ty
+            n = math.hypot(dx, dy) or 1.0
+            ox, oy = -dy / n, dx / n
+            for o in offsets:
+                if m.los_fine((tx, ty, tz + eye), (px + ox * o, py + oy * o, gz)):
+                    return False
+            if flank > 0:
+                for s in (flank, -flank):
+                    if m.los_fine((tx + ox * s, ty + oy * s, tz + eye), (px, py, gz)):
+                        return False
+        return True
+
+    def _cover_zone_ok(self, obs, px, py, travel) -> bool:
+        """Can we still walk from (px, py) to the next circle in time after hiding there for a while?"""
+        zone, t, me = obs["zone"], obs["t"], obs["self"]
+        c, r = self._zone_now(zone, t + travel + self.COVER_QUIET_S)
+        if math.hypot(px - c[0], py - c[1]) > r - 6.0:
+            return False
+        nc, nr = zone["next_center"], zone["next_radius"]
+        seed = self._seed_radius(nr)
+        d = math.hypot(px - nc[0], py - nc[1])
+        if d <= seed:
+            return True
+        path = d - seed
+        if self.field is not None and self.field.done:
+            v = self.field.value(px, py)
+            if v < float("inf"):
+                path = v
+        speed = me["stats"].get("walk_speed", 11.7) or 11.7
+        return travel + self.COVER_QUIET_S + 1.4 * path / speed <= zone["shrink_end"] - t
+
+    def _find_cover(self, obs, threats, budget_s=0.014, avoid=()):
+        """Nearest straight-line-reachable spot hidden from every threat and safe from the zone, or None.
+        Skips bearings within 40 degrees of `avoid` (headings we got stuck on).
+        Bounded: candidate screening stops at 60% of budget_s and validation at 100% (plus one step)."""
+        m = self.map
+        if m is None or not threats:
+            return None
+        t0 = time.perf_counter()
+        me = obs["self"]
+        x, y = me["pos"][0], me["pos"][1]
+        speed = me["stats"].get("walk_speed", 11.7) or 11.7
+        eye, body = me["stats"].get("eye_height", 8.0), me["stats"].get("height", 9.0) - 1.5
+        eyes = [(tx, ty, tz + eye) for tx, ty, tz in threats]
+        near_b = math.atan2(threats[0][1] - y, threats[0][0] - x)
+        cands = []
+        # bearings away from the nearest shooter first, so a cut-short search still saw the likeliest spots
+        for toward, a in sorted((max(0.0, math.cos(k * TAU / 12 - near_b)), k * TAU / 12) for k in range(12)):
+            if any(abs(wrap(a - b)) < 0.7 for b in avoid):
+                continue
+            ca, sa = math.cos(a), math.sin(a)
+            reach = m.free_dist(x, y, a, 40.0)
+            for r in (6.0, 10.0, 15.0, 21.0, 28.0, 36.0):
+                if r > reach:
+                    break
+                px, py = x + ca * r, y + sa * r
+                c = m.cell(px, py)
+                if c < 0 or m.blocked[c] or m.cost[c] >= 3.0:   # off map, wall, or a ledge that needs a jump
+                    continue
+                travel = r / speed
+                if not self._cover_zone_ok(obs, px, py, travel):
+                    continue
+                gz = m.ground_at(px, py) + body
+                if any(m.los(e, (px, py, gz)) for e in eyes):      # coarse screen
+                    continue
+                score = travel + 1.5 * toward + (0.0 if m.cost[c] > 1.2 else 0.8)   # prefer hugging a wall
+                cands.append((score, px, py, r))
+            if time.perf_counter() - t0 > budget_s * 0.6:
+                break
+        cands.sort()
+        for score, px, py, r in cands[:10]:
+            if time.perf_counter() - t0 > budget_s:
+                break
+            if self._hidden(obs, px, py, threats, flank=self.COVER_FLANK_M):
+                return px, py, r
+        return None
+
+    def _cover_update(self, obs, enemies, hp_r, budget_s=0.014):
+        """Track the exchange, start/maintain/end a cover episode. Returns the active episode or None.
+        Spot searches run only with >= 4 ms of budget; otherwise they wait for the next tick."""
+        t, me = obs["t"], obs["self"]
+        can_search = budget_s >= 0.004
+        mx = max(me.get("max_hp") or 1, 1)
+        damaged = False
+        for ev in obs["events"]:
+            kind = ev.get("type")
+            if kind == "damaged" and ev.get("by") is not None and ev.get("weapon") not in ("zone", "npc"):
+                self.cov_taken.append((t, ev.get("amount") or 0.0))
+                self.hit_from[ev["by"]] = (t, ev.get("bearing"))
+                self.last_mech_hit = t
+                damaged = True
+            elif kind == "hit" and not self._is_prop(ev.get("target")):
+                self.cov_dealt.append((t, ev.get("amount") or 0.0))
+        w = self.COVER_WINDOW_S
+        self.cov_taken = [p for p in self.cov_taken if t - p[0] <= w]
+        self.cov_dealt = [p for p in self.cov_dealt if t - p[0] <= w]
+        for k in [k for k, v in self.hit_from.items() if t - v[0] > 8.0]:
+            del self.hit_from[k]
+        alive = obs.get("alive", 16)
+        urgency = self._urgency(obs)
+        pos = me["pos"]
+        c = self.cover
+        if c is not None:
+            reason = None
+            if alive <= 2:
+                reason = "final"
+            elif urgency >= self.COVER_END_URGENCY:
+                reason = "zone"
+            elif c["arrived"] and hp_r >= self.COVER_EXIT_HP and t - self.last_mech_hit >= self.COVER_QUIET_S:
+                reason = "healed"
+            elif t - c["t0"] >= self.COVER_MAX_S:
+                reason = "timeout"
+            if reason is None:
+                threats = self._cover_threats(obs, enemies) or c["threats"]
+                c["threats"] = threats
+                repick = None
+                if not c["arrived"] and t - c["prog_t"] >= 1.0:
+                    if math.dist(c["prog_pos"], pos[:2]) < 1.0:
+                        repick = "stuck"
+                        c["stuck"] += 1
+                        c["bad"].append(math.atan2(c["y"] - pos[1], c["x"] - pos[0]))
+                    c["prog_t"], c["prog_pos"] = t, tuple(pos[:2])
+                if repick is None and c["arrived"] and damaged and t - c["picked"] >= 1.0:
+                    repick = "seen"          # hit while holding the spot: someone has a line on it
+                if repick is None and (damaged or t - c["checked"] >= 0.5) and t - c["picked"] >= 1.0:
+                    c["checked"] = t
+                    if not self._hidden(obs, c["x"], c["y"], threats):
+                        repick = "seen"
+                if repick is not None and can_search:
+                    spot = None
+                    if c["repicks"] < self.COVER_REPICKS and c["stuck"] < 2:   # stuck twice: walk normally
+                        spot = self._find_cover(obs, threats, budget_s, avoid=c["bad"])
+                    if spot is None:
+                        reason = "exposed" if repick == "seen" else "stuck"
+                    else:
+                        c.update(x=spot[0], y=spot[1], repicks=c["repicks"] + 1, picked=t, checked=t,
+                                 arrived=False, prog_t=t, prog_pos=tuple(pos[:2]))
+            if reason is not None:
+                self._end_cover(t, reason, hp_r)
+                return None
+            if not c["arrived"] and math.hypot(c["x"] - pos[0], c["y"] - pos[1]) < 2.5:
+                c["arrived"] = True
+                if c["reached_hp"] is None:        # first arrival of the episode
+                    c["reached_hp"], c["reached_t"] = round(hp_r, 2), round(t - c["t0"], 1)
+            return c
+        # not hiding: is this a losing exchange worth leaving?
+        if t < self.cover_next or alive <= 2 or urgency >= self.COVER_START_URGENCY or self.map is None \
+                or not can_search:
+            return None
+        taken = sum(a for _, a in self.cov_taken)
+        if len(self.cov_taken) < 2 or taken < self.COVER_TAKEN * mx:
+            return None
+        dealt = sum(a for _, a in self.cov_dealt)
+        if dealt >= self.COVER_RATIO * taken:
+            return None
+        vis = [e for e in enemies if self._threat(obs, e)]
+        if len(vis) == 1 and hp_r >= 0.3 and self._hp_frac(vis[0]) <= self.COVER_FINISH_HP:
+            return None
+        threats = self._cover_threats(obs, enemies)
+        t1 = time.perf_counter()
+        spot = self._find_cover(obs, threats, budget_s)
+        ms = (time.perf_counter() - t1) * 1000
+        if spot is None:
+            self.cover_next = t + 1.0      # nothing reachable is hidden: keep the old behavior, look again soon
+            return None
+        self.cover = {"x": spot[0], "y": spot[1], "t0": t, "hp0": round(hp_r, 2), "threats": threats,
+                      "arrived": False, "reached_hp": None, "repicks": 0, "picked": t, "checked": t,
+                      "prog_t": t, "prog_pos": tuple(pos[:2]), "stuck": 0, "bad": []}
+        log(f"COVER start t={t:.1f} hp={hp_r:.2f} taken={taken / mx:.2f} dealt={dealt / mx:.2f} "
+            f"threats={len(threats)} dist={spot[2]:.0f} ms={ms:.1f}")
+        return self.cover
+
+    def _end_cover(self, t, reason, hp_r) -> None:
+        c = self.cover
+        log(f"COVER end t={t:.1f} reason={reason} dur={t - c['t0']:.1f} reached_hp={c['reached_hp']} "
+            f"reached_s={c.get('reached_t')} hp={hp_r:.2f} repicks={c['repicks']}")
+        self.cover = None
+        # A failed spot says nothing about the exchange: look again soon. Otherwise give normal play room.
+        wait = self.COVER_RETRY_S if reason in ("exposed", "stuck") else self.COVER_COOLDOWN_S
+        self.cover_next = t + wait
+        self.cov_taken.clear()
+        self.cov_dealt.clear()
+
+    def _cover_move(self, obs, c, target, fire, aim_yaw, aim_pitch):
+        """Move, boost, fire and aim while an episode is active. Faces the nearest shooter (rear hits hurt more)."""
+        me = obs["self"]
+        x, y = me["pos"][0], me["pos"][1]
+        dx, dy = c["x"] - x, c["y"] - y
+        d = math.hypot(dx, dy)
+        weapons = me["weapons"]
+        # Keep only shots computed against a mech target; the laser charge slows us down and its beam
+        # needs the very line we are trying to break.
+        fire = [bool(f) and target is not None and target.get("kind") == "mech" and not (w and w["kind"] == "laser")
+                for w, f in zip(weapons, fire)] + [False] * (2 - len(weapons))
+        if c["arrived"] and d < 4.0:
+            move, boost, fire = (0.0, 0.0), False, [False, False]     # hold still and quiet: let regen start
+        else:
+            move, boost = (dx / max(d, 1e-6), dy / max(d, 1e-6)), me["energy"] > 25 and d > 5.0
+        if (target is None or c["arrived"]) and c["threats"]:
+            tx, ty = c["threats"][0][0], c["threats"][0][1]
+            aim_yaw, aim_pitch = math.atan2(ty - y, tx - x), 0.0
+        return move, boost, fire[:2], aim_yaw, aim_pitch
 
     # ------------------------------------------------------------------ weapons
     def _weapons(self, obs, target, mode):

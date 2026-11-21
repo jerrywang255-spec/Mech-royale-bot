@@ -8,7 +8,7 @@ These are code-review hypotheses, not measured rankings. Use match evidence to r
 2. **Zone/combat vector conflict:** still open. High urgency adds boost, and the zone pull usually outweighs combat vectors, but retreat (1.6) can beat the pull at low/mid urgency. E006 fixed only the `_camp` case. Add an explicit safety override if telemetry shows `out_zone_s` or `taken.zone` > 0.
 3. **Single-target threat model:** patched in E004 (`_threats`, outnumbered retreat). Beams, sounds and projectiles are not yet part of the threat set.
 4. **Automatic close-range fights:** partly open. A single enemy within 60 m still triggers `fight`; only 2+ threats now retreat.
-5. **Weak retreat/regeneration:** partly patched in E005 (recovery latch to 70%). Retreat still has no explicit cover target; LOS breaking relies on `_steer`'s hide bonus.
+5. **Weak retreat/regeneration:** partly patched in E005 (recovery latch to 70%). Retreat still has no explicit cover target; LOS breaking relies on `_steer`'s hide bonus. E008 (workspace `bot.py` lineage) adds an explicit hidden spot for *losing exchanges* only; next: partial cover when no spot hides from every shooter (91% of harness episodes ended `exposed`).
 6. **Exceptions on optional fields:** patched in E001 (`clean_obs`, `hp_frac`, zone-seeking fallback).
 
 ## P1: avoidable damage and positioning

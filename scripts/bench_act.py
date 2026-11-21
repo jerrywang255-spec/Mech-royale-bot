@@ -1,6 +1,6 @@
 """Worst-case act() latency on synthetic observations. Host-machine numbers, not the 1-CPU container.
 
-    python scripts/bench_act.py [--bot-dir Mech-royale-bot] [--size 2048] [--ticks 900]
+    python scripts/bench_act.py [--bot-dir .] [--size 2048] [--ticks 900]
 
 Scenario per tick: up to 15 visible mechs (30-250 m), crowded loot/sound/projectile lists, alternating
 fight and retreat (retreat runs 16 hide-LOS checks), and two zone changes that rebuild the Dijkstra field.
@@ -94,11 +94,13 @@ def pct(xs, p):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bot-dir", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Mech-royale-bot"))
+    ap.add_argument("--bot-dir", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ap.add_argument("--size", type=float, default=2048.0)
     ap.add_argument("--buildings", type=int, default=400)
     ap.add_argument("--ticks", type=int, default=900)
     ap.add_argument("--seed", type=int, default=5)
+    ap.add_argument("--arena-dir", default=None,
+                    help="write the arena here instead of a TemporaryDirectory (some sandboxes can't delete those)")
     args = ap.parse_args()
     sys.path.insert(0, os.path.abspath(args.bot_dir))
     B = importlib.import_module("bot")
@@ -107,13 +109,17 @@ def main():
     phases = {0: zone((0, 0), s * 0.45, (60, -40), s * 0.30, 30, 60),
               300: zone((60, -40), s * 0.30, (20, 10), s * 0.15, 45, 75),
               600: zone((20, 10), s * 0.15, (0, 0), s * 0.05, 70, 85)}
-    with tempfile.TemporaryDirectory() as d:
+    arena = contextlib.nullcontext(args.arena_dir) if args.arena_dir else tempfile.TemporaryDirectory()
+    with arena as d:
         make_arena(d, s, args.buildings, args.seed)
         log = io.StringIO()
         with contextlib.redirect_stderr(log):
+            # `weapons` is required by the schema; without it act() raised on every tick at the mortar dodge.
             bot = B.Bot({"type": "hello", "slot": 0, "seed": 1, "map": {"dir": d, "files": []},
                          "config": {"mech": {"step_up": 1.2, "height": 9.0}, "loot": {"pickup_radius": 4.0},
-                                    "vision": {"near_range": 30}}})
+                                    "vision": {"near_range": 30},
+                                    "weapons": {"gun": {}, "laser": {}, "lightning": {},
+                                                "mortar": {"gravity": 22.0, "splash_radius": 7.0}}}})
         me, z, times, errs = (10.0, 10.0), phases[0], [], 0
         for tick in range(args.ticks):
             z = phases.get(tick, z)

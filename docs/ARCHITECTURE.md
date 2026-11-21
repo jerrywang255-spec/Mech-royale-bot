@@ -2,6 +2,24 @@
 
 Update this file when module responsibilities or major decision flows change.
 
+> **Drift note (2026-11-21, E008):** the workspace `bot.py` (baseline SHA-256 `97bce237…`) is not the E001–E007 candidate this file describes. It has no `clean_obs()`, `Telemetry`, `_threats()`, `recovering` latch or `_has_shot()`; `_decide()` uses `_threat()` and a `_retreating` flag instead. The "Current decision flow" below is therefore partly stale, and 43 of the 50 older tests in `tests/` fail or error against this `bot.py` (before and after E008). The "Cover episode" section describes code that is present.
+
+## Cover episode (E008, `Bot.COVER`, env `SURVIVOR_COVER=0` disables)
+
+Runs in `act()` right after `_decide()`; when no episode is active and none starts, the tick is exactly the old path.
+
+1. `_cover_update()` keeps 3 s windows of mech damage taken (`damaged` with `by`, not zone/npc) and damage dealt (`hit` on anything not known as a drone or crate), and the last hit bearing per attacker.
+2. **Start** when: ≥ 2 mech hits and ≥ `COVER_TAKEN` (10%) of max HP taken in the window, dealt < `COVER_RATIO` (0.5) × taken, `alive > 2`, zone urgency < 0.5, map loaded, not inside the cooldown, and not finishing a lone visible threat at ≤ 25% HP while we have ≥ 30%.
+3. `_find_cover()` scores 12 bearings × 6 radii (6–36 m), away-from-the-shooter bearings first. A candidate must be straight-line walkable (`free_dist`), not a ledge cell, inside the zone after travel + 5 s with time left to reach the next circle (`_cover_zone_ok`), and hidden from up to 3 threats (visible threats via `_threat()`, else remembered positions, else 100 m along the hit bearing). Coarse `Map.los` screens; `Map.los_fine` validates with ±2.5 m body offsets and each shooter stepped ±10 m sideways. Bounded by the time left in a 14 ms slice; with < 4 ms left (e.g. a new zone Field this tick) the search waits a tick.
+4. `_cover_move()` walks straight to the spot (bypassing `_steer`), boosts with energy > 25, keeps only gun/mortar shots computed against a mech target, never charges the laser; on arrival it stands still, holds fire, and faces the nearest threat.
+5. **Re-pick** (≤ 6 per episode) when the spot is seen (checked every 0.5 s or on a hit), when hit while holding it, or after no progress for 1 s (that heading is excluded; a second stall ends the episode).
+6. **End** on `healed` (arrived, ≥ 90% HP, 5 s without mech damage), `zone` (urgency ≥ 0.7), `timeout` (25 s), `final` (alive ≤ 2), `exposed`/`stuck` (no new spot). Cooldown before the next start: 4 s, or 1 s after `exposed`/`stuck`. The damage windows are cleared at the end.
+7. Any exception inside the cover logic logs once and sets `COVER = False` for the rest of the match.
+
+Stderr lines (low rate): `CONFIG mech k=v …` once at start (to check the assumed 5 s regeneration delay against the real config keys), `COVER start t= hp= taken= dealt= threats= dist= ms=`, `COVER end t= reason= dur= reached_hp= reached_s= hp= repicks=`, and one `LAST t= hp= hp_r= alive= mode= cover=` at interpreter exit (last observation; not written if the process is killed).
+
+Tools: `scripts/exchange_sim.py` (synthetic exchange harness, not a match simulator), `scripts/bench_cover.py` (trigger-tick latency), `scripts/compare_runs.py` (paired placement comparison from a real runner).
+
 ## Files
 
 - `bot.py`: per-tick policy. Remembers observations, chooses targets/modes, selects movement and weapons, handles loot/upgrades, and performs local steering.

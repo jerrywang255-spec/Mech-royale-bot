@@ -1,0 +1,1 @@
+{"terrain": {"nx": 320, "ny": 320, "minX": -160.0, "minY": -160.0, "step": 1.0, "file": "terrain.i16", "scale": 0.01}, "prisms": [{"kind": "building", "ring": [-20.0, 10.0, 20.0, 10.0, 20.0, 22.0, -20.0, 22.0], "base": 0.0, "top": 20.0}]}

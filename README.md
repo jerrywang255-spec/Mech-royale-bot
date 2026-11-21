@@ -9,7 +9,7 @@ A placement-first bot for the Builders Buildathon **Mech Royale** track. It read
 | --- | --- |
 | 1. Zone | Builds a walking map of the campus at startup and follows the shortest route around buildings into the *next* circle well before it shrinks. Boosts when time is short. |
 | 2. Pick fights carefully | Fights back when shot, when an enemy is within 60 m, when only 3 mechs are left, or when the enemy is clearly weaker. Otherwise it backs away and keeps facing them (rear hits do 1.5x damage). |
-| 3. Retreat to heal | Below 35% HP it backs off toward headings that put a building between it and the attacker, so health regenerates. |
+| 3. Retreat to heal | Below 50% HP it backs off toward headings that put a building between it and the attacker, so health regenerates. When it is losing a trade (≥ 10% HP lost to mechs in 3 s while dealing back less than half), it walks to the nearest reachable spot no known shooter can see, waits there until regeneration has started, then plays on. Set `SURVIVOR_COVER=0` to switch that off. |
 | 4. Shoot well | Leads gun shots on moving targets; charges the laser and fires only when lined up; fires lightning inside its 45 m cone; lobs mortar shells, even over buildings. Sidesteps a laser that is aimed at it. |
 | 5. Loot | Picks up laser > lightning > mortar, grabs cubes and supply drops when it's quiet, shoots crates, and picks armor and HP upgrades first. |
 
