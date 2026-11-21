@@ -53,7 +53,17 @@ SCENARIOS = {
     "outgunned1": dict(n=1, pe0=0.8, pu0=0.15, ehp=2000.0, hp0=1.0, zone="static"),
     "squad3": dict(n=3, pe0=0.5, pu0=0.35, ehp=1500.0, hp0=1.0, zone="static"),
     "winning1": dict(n=1, pe0=0.25, pu0=0.8, ehp=700.0, hp0=1.0, zone="static"),
+    # duels we can win: do repeated retreats give them up? (exp. 1 watch-item)
+    "even1": dict(n=1, pe0=0.45, pu0=0.45, ehp=1500.0, hp0=1.0, zone="static"),
+    "edge1": dict(n=1, pe0=0.55, pu0=0.6, ehp=1200.0, hp0=1.0, zone="static"),
     "rotate2": dict(n=2, pe0=0.55, pu0=0.3, ehp=1500.0, hp0=0.9, zone="rotate"),
+    # --- situations for the five-experiment review. zone="rand": a per-seed closing circle that a straight
+    # walk at walk speed only just beats (1-10 s of slack), so departure timing decides zone damage.
+    "zonequiet": dict(n=0, pe0=0.0, pu0=0.0, ehp=1.0, hp0=1.0, zone="rand", zdps=60.0),
+    "zoneclose2": dict(n=2, pe0=0.5, pu0=0.3, ehp=1500.0, hp0=0.9, zone="rand", zdps=60.0),
+    "kite1": dict(n=1, pe0=0.35, pu0=0.3, ehp=1500.0, hp0=1.0, zone="rand", zdps=60.0, kite=True),
+    # hunters that out-shoot us while the circle closes: the cover hold and the zone deadline collide here
+    "zonepin2": dict(n=2, pe0=0.8, pu0=0.15, ehp=2000.0, hp0=0.8, zone="rand", zdps=60.0),
 }
 
 
@@ -194,6 +204,8 @@ def spawn(world, seed, n):
         me = [rng.uniform(-90, 90), rng.uniform(-90, 90)]
         if world.solid(me[0], me[1]) or world.solid(me[0] + 3, me[1]) or world.solid(me[0], me[1] + 3):
             continue
+        if n == 0:
+            return me, []
         foes = []
         base = rng.uniform(-math.pi, math.pi)
         for k in range(n):
@@ -209,7 +221,9 @@ def spawn(world, seed, n):
     raise RuntimeError("no spawn")
 
 
-def zone_for(kind):
+def zone_for(kind, seed=0, me=None):
+    if kind == "rand":
+        return zone_rand(seed, me)
     if kind == "rotate":
         return {"center": [0.0, 0.0], "radius": 300.0, "next_center": [140.0, 60.0], "next_radius": 90.0,
                 "shrink_start": T0 + 5.0, "shrink_end": T0 + 35.0, "dps": 5}
@@ -222,6 +236,69 @@ def zone_now(z, t):
     f = 0.0 if t <= ss else min(1.0, (t - ss) / (se - ss))
     c = [z["center"][i] + (z["next_center"][i] - z["center"][i]) * f for i in range(2)]
     return c, z["radius"] + (z["next_radius"] - z["radius"]) * f
+
+
+def seed_radius(r):
+    return r * 0.6 if r > 40 else max(r * 0.5, 6.0)      # same rule the bot uses for "safe enough"
+
+
+def edge_time(z, me, t):
+    """Seconds until the closing circle excludes `me` if we stand still (0 = already outside, inf = never)."""
+    for k in range(0, 161):
+        c, r = zone_now(z, t + k * 0.5)
+        if math.dist(c, me) > r:
+            return k * 0.5
+    return math.inf
+
+
+def straight_slack(z, me, t0=T0, speed=None):
+    """Longest start delay (s) after which a straight walk to the next circle's seed area never leaves the
+    moving circle. -1 = even leaving at once fails; inf = already inside the seed area."""
+    speed = speed or ASSUME["walk"]
+    nc, nr = z["next_center"], z["next_radius"]
+    d = math.dist(me, nc)
+    sr = seed_radius(nr)
+    if d <= sr:
+        return math.inf
+    ux, uy = (nc[0] - me[0]) / d, (nc[1] - me[1]) / d
+    best = -1.0
+    for k in range(0, 241):                      # start delays up to 120 s
+        delay = k * 0.5
+        ok = True
+        for j in range(0, 481):                  # horizon 240 s
+            tau = j * 0.5
+            walked = max(0.0, tau - delay) * speed
+            walked = min(walked, d - sr)
+            p = (me[0] + ux * walked, me[1] + uy * walked)
+            c, r = zone_now(z, t0 + tau)
+            if math.dist(c, p) > r:
+                ok = False
+                break
+            if walked >= d - sr:
+                break
+        if ok:
+            best = delay
+        else:
+            break
+    return best
+
+
+def zone_rand(seed, me):
+    """Random closing circle (starting circle covers the arena) with 1-10 s of straight-walk slack from `me`."""
+    rng = random.Random(seed * 104729 + 7)
+    z = None
+    for _ in range(600):
+        r0, nr = rng.uniform(230.0, 300.0), rng.uniform(45.0, 110.0)
+        ang, off = rng.uniform(-math.pi, math.pi), rng.uniform(0.0, r0 - nr - 15.0)
+        hold, shrink = rng.uniform(2.0, 10.0), rng.uniform(14.0, 36.0)
+        z = {"center": [0.0, 0.0], "radius": r0, "next_center": [math.cos(ang) * off, math.sin(ang) * off],
+             "next_radius": nr, "shrink_start": T0 + hold, "shrink_end": T0 + hold + shrink, "dps": 5}
+        s = straight_slack(z, me)
+        if 1.0 <= s <= 10.0:
+            z["slack0"] = s
+            return z
+    z["slack0"] = straight_slack(z, me)
+    return z
 
 
 def hello(map_dir, seed):
@@ -237,12 +314,14 @@ def run_episode(Bot, map_dir, world, scen_name, seed):
     sc = SCENARIOS[scen_name]
     A = ASSUME
     me, foes = spawn(world, seed, sc["n"])
-    z = zone_for(sc["zone"])
+    z = zone_for(sc["zone"], seed, me)
+    zdps = sc.get("zdps", A["zone_dps"])
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
         bot = Bot(hello(map_dir, seed))
     hp, mx = A["max_hp"] * sc["hp0"], A["max_hp"]
-    energy, vel, yaw = 100.0, [0.0, 0.0], math.atan2(foes[0][1] - me[1], foes[0][0] - me[0]) + 1.2
+    energy, vel = 100.0, [0.0, 0.0]
+    yaw = (math.atan2(foes[0][1] - me[1], foes[0][0] - me[0]) + 1.2) if foes else 0.0
     pitch = 0.0
     gun = {"cd": 0.0, "ammo": A["gun_mag"], "reload": 0.0}
     enemies = [{"id": 1 + k, "pos": list(p), "vel": [0.0, 0.0], "hp": sc["ehp"], "cd": 0.3 * k, "sign": 1 - 2 * (k % 2)}
@@ -251,10 +330,16 @@ def run_episode(Bot, map_dir, world, scen_name, seed):
     events, t = [], T0
     rec = {"scenario": scen_name, "seed": seed, "survived": True, "t_alive": DURATION, "taken": 0.0, "dealt": 0.0,
            "kills": 0, "exposed_s": 0.0, "losing_s": 0.0, "zone_dmg": 0.0, "min_hp": hp / mx, "regen_hp": 0.0,
-           "disengage_ts": []}
+           "disengage_ts": [], "slack0": z.get("slack0"), "late_s": 0.0, "thin_s": 0.0, "combat_thin_s": 0.0,
+           "min_margin": math.inf, "pursuit_s": 0.0, "pursuit_thin_s": 0.0, "pursuit_ts": [], "fired": 0,
+           "fired_muzzle_blocked": 0, "fired_eye_ok_muzzle_blocked": 0, "heavy_ts": [], "engage_hp": [],
+           "zone_dmg_at_death": 0.0, "done_enemy_hp_left": None}
     prev_label = ""
+    prev_d_next = math.dist(me, z["next_center"])
+    last_vis_t, prev_vis_n, heavy_on = -99.0, 0, False
     hist = deque()              # (t, label, fired, exposed, hp, pos) for the death window
     win = deque()               # (t, taken, dealt) for the sim-side losing-exchange metric
+    zwin = deque()              # (t, zone damage) for "zone was still hurting at death"
     lat = []
     tick = 0
     while t < T0 + DURATION - 1e-9:
@@ -317,6 +402,20 @@ def run_episode(Bot, map_dir, world, scen_name, seed):
         fire = act.get("fire") or [False, False]
         if fire and fire[0] and gun["cd"] == 0 and gun["ammo"] > 0 and gun["reload"] == 0:
             fired = True
+            rec["fired"] += 1
+            # exp. 4: a shot is geometry-wasted when something is inside the aim tolerance but every bullet line
+            # (muzzle 7 m -> target top/mid) is blocked. Eye-clear = the bot's own 8 m sight line was clear.
+            mz = (me[0], me[1], 7.0)
+            in_tol = []
+            for e in live:
+                d_ = math.dist(e["pos"], me)
+                err_ = abs(wrap(yaw - math.atan2(e["pos"][1] - me[1], e["pos"][0] - me[0])))
+                if d_ <= A["gun_range"] and err_ <= math.atan2(2.5, d_) + 0.005:
+                    in_tol.append((e, world.clear(mz, (e["pos"][0], e["pos"][1], 4.5))
+                                   or world.clear(mz, (e["pos"][0], e["pos"][1], 7.5))))
+            if in_tol and not any(ok for _, ok in in_tol):
+                rec["fired_muzzle_blocked"] += 1
+                rec["fired_eye_ok_muzzle_blocked"] += any(world.sees(me, e["pos"]) for e, _ in in_tol)
             gun["cd"], gun["ammo"] = A["gun_period"], gun["ammo"] - 1
             if gun["ammo"] == 0:
                 gun["reload"] = A["gun_reload"]
@@ -348,7 +447,10 @@ def run_episode(Bot, map_dir, world, scen_name, seed):
             los = d <= 230 and world.sees(e["pos"], me)
             if los:
                 b = math.atan2(me[1] - e["pos"][1], me[0] - e["pos"][0])
-                radial = 1.0 if d > A["enemy_pref_range"] + 15 else (-1.0 if d < A["enemy_pref_range"] - 25 else 0.0)
+                if sc.get("kite"):     # keeps 140-200 m away from us: backs off when closer, never closes in
+                    radial = -1.0 if d < 140.0 else (0.0 if d < 200.0 else 0.6)
+                else:
+                    radial = 1.0 if d > A["enemy_pref_range"] + 15 else (-1.0 if d < A["enemy_pref_range"] - 25 else 0.0)
                 if int((t - T0) / 2.0) % 2:
                     e["sign"] = -e["sign"] if (int((t - T0) * 10) % 20) == 0 else e["sign"]
                 sx, sy = -math.sin(b) * e["sign"] * 0.5, math.cos(b) * e["sign"] * 0.5
@@ -375,10 +477,11 @@ def run_episode(Bot, map_dir, world, scen_name, seed):
                     ev["rear"] = True
                 events.append(ev)
         if not in_zone:
-            amt = A["zone_dps"] * DT
+            amt = zdps * DT
             hp -= amt
             rec["taken"] += amt
             rec["zone_dmg"] += amt
+            zwin.append((t, amt))
             last_dmg = t
             events.append({"type": "damaged", "amount": amt, "weapon": "zone", "bearing": None, "by": None})
         if hp > 0 and t - last_dmg >= A["regen_delay_s"] and hp < mx:
@@ -388,9 +491,49 @@ def run_episode(Bot, map_dir, world, scen_name, seed):
         # ---- metrics
         while win and t - win[0][0] > 3.0:
             win.popleft()
+        while zwin and t - zwin[0][0] > 3.0:
+            zwin.popleft()
         tk, dl = sum(w[1] for w in win), sum(w[2] for w in win)
         if tk >= 0.10 * mx and dl < 0.5 * tk:
             rec["losing_s"] += DT
+        heavy = tk >= 0.25 * mx                       # exp. 1: rapid armor loss from mechs
+        if heavy and not heavy_on:
+            rec["heavy_ts"].append(round(t - T0, 1))
+        heavy_on = heavy
+        n_vis = len(vis)
+        if n_vis and not prev_vis_n and t - last_vis_t >= 6.0:
+            rec["engage_hp"].append(round(max(hp, 0.0) / mx, 2))     # armor when the next engagement starts
+        if n_vis:
+            last_vis_t = t
+        prev_vis_n = n_vis
+        # zone departure margin (exp. 2): seconds until the closing circle excludes us minus the straight-walk
+        # time to the next circle's safe area. < 0 = even leaving now costs zone damage.
+        margin = math.inf
+        if sc["zone"] != "static" and t < z["shrink_end"] + 2.0:
+            d_next = math.dist(me, z["next_center"])
+            need = max(0.0, d_next - seed_radius(z["next_radius"]))
+            if need > 0:
+                et = edge_time(z, me, t)
+                margin = et - need / A["walk"] if et != math.inf else math.inf
+                rec["min_margin"] = min(rec["min_margin"], margin)
+                progress = (prev_d_next - d_next) / DT
+                if margin < 3.0:
+                    rec["thin_s"] += DT
+                    if label.startswith(("fight", "retreat", "cover", "avoid")):
+                        rec["combat_thin_s"] += DT
+                    if margin < 1.5 and progress < 0.4 * A["walk"]:
+                        rec["late_s"] += DT                 # margin nearly gone and not heading for safety
+            prev_d_next = d_next
+        # exp. 3: pursuing = a "fight" tick moving toward a visible enemy while our hits did nothing for 3 s
+        if label.startswith("fight") and vis:
+            nv = min(vis, key=lambda v: math.dist(v["pos"][:2], me))
+            dx, dy = nv["pos"][0] - me[0], nv["pos"][1] - me[1]
+            dn = math.hypot(dx, dy) or 1.0
+            if (vel[0] * dx + vel[1] * dy) / dn > 3.0 and dl <= 0.0:
+                rec["pursuit_s"] += DT
+                rec["pursuit_ts"].append(round(t - T0, 1))
+                if margin < 6.0:
+                    rec["pursuit_thin_s"] += DT
         rec["exposed_s"] += DT if exposed else 0.0
         rec["min_hp"] = min(rec["min_hp"], max(hp, 0.0) / mx)
         hist.append((t, label, fired, exposed, hp, tuple(me)))
@@ -401,6 +544,7 @@ def run_episode(Bot, map_dir, world, scen_name, seed):
             hist.popleft()
         if hp <= 0:
             rec["survived"], rec["t_alive"] = False, round(t - T0 + DT, 1)
+            rec["zone_dmg_at_death"] = round(sum(a for _, a in zwin), 1)
             n_ = len(hist) or 1
             rec["death_window"] = {
                 "fight": round(sum(h[1].startswith("fight") for h in hist) / n_, 2),
@@ -424,8 +568,11 @@ def run_episode(Bot, map_dir, world, scen_name, seed):
     rec["cover_reached_s"] = [float(ln.split("reached_s=")[1].split()[0]) for ln in log_txt.splitlines()
                               if ln.startswith("COVER end") and "reached_s=" in ln and "reached_s=None" not in ln]
     rec["exceptions"] = log_txt.count("Traceback")
-    for k in ("taken", "dealt", "exposed_s", "losing_s", "zone_dmg", "min_hp", "regen_hp"):
+    for k in ("taken", "dealt", "exposed_s", "losing_s", "zone_dmg", "min_hp", "regen_hp", "late_s", "thin_s",
+              "combat_thin_s", "pursuit_s", "pursuit_thin_s"):
         rec[k] = round(rec[k], 3)
+    rec["min_margin"] = None if rec["min_margin"] == math.inf else round(rec["min_margin"], 2)
+    rec["pursuit_ts"] = rec["pursuit_ts"][-40:]
     return rec
 
 
@@ -446,6 +593,34 @@ def load_variant(spec):
 def pct(xs, p):
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(round(p / 100 * (len(xs) - 1))))] if xs else 0.0
+
+
+def situations(results, names, scen_names):
+    """Per-variant frequency of the five reviewed situations (synthetic; counts, not placements)."""
+    print("\n## Situations (per episode averages; 'zone deaths' = died with zone damage in the last 3 s)")
+    print("| scenario | variant | n | exp1 heavy loss/ep | exp1 died <=10 s after | exp1 hp at next engagement | "
+          "exp2 zone dmg %max | exp2 zone deaths | exp2 thin s | exp2 late s | exp2 combat-thin s | "
+          "exp3 pursuit s | exp3 pursuit-thin s | exp3 died <=10 s after pursuit | exp4 shots | exp4 muzzle-blocked |")
+    print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for sc in scen_names + ["ALL"]:
+        for v in names:
+            rows = [r for r in results[v] if sc == "ALL" or r["scenario"] == sc]
+            if not rows:
+                continue
+            mean = lambda k: statistics.mean(r[k] for r in rows)  # noqa: E731
+            heavy = sum(len(r["heavy_ts"]) for r in rows)
+            died_after_heavy = sum(any(0 <= r["t_alive"] - h <= 10.0 for h in r["heavy_ts"])
+                                   for r in rows if not r["survived"])
+            eng = [x for r in rows for x in r["engage_hp"]]
+            zd = sum(1 for r in rows if not r["survived"] and r["zone_dmg_at_death"] > 0)
+            died_after_pursuit = sum(bool(r["pursuit_ts"]) and 0 <= r["t_alive"] - r["pursuit_ts"][-1] <= 10.0
+                                     for r in rows if not r["survived"])
+            fired = sum(r["fired"] for r in rows)
+            print(f"| {sc} | {v} | {len(rows)} | {heavy / len(rows):.2f} | {died_after_heavy} | "
+                  f"{statistics.mean(eng) if eng else float('nan'):.2f} | {100 * mean('zone_dmg') / ASSUME['max_hp']:.1f} | "
+                  f"{zd} | {mean('thin_s'):.1f} | {mean('late_s'):.2f} | {mean('combat_thin_s'):.1f} | "
+                  f"{mean('pursuit_s'):.1f} | {mean('pursuit_thin_s'):.2f} | {died_after_pursuit} | {fired} | "
+                  f"{sum(r['fired_muzzle_blocked'] for r in rows)} ({sum(r['fired_eye_ok_muzzle_blocked'] for r in rows)} eye-clear) |")
 
 
 def report(results, names, scen_names):
@@ -545,6 +720,7 @@ def main():
           f"python {sys.version.split()[0]}, wall {time.perf_counter() - t_start:.0f} s")
     print("assumptions: " + json.dumps(ASSUME))
     report(results, names, scen_names)
+    situations(results, names, scen_names)
     if args.json:
         with open(args.json, "w") as f:
             for n in names:

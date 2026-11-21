@@ -13,6 +13,7 @@ finish well inside 50 ms on 1 CPU, so the heavy map work happens a slice at a ti
 from __future__ import annotations
 
 import atexit
+import json
 import math
 import os
 import random
@@ -47,12 +48,36 @@ def log(*a) -> None:
 
 
 _LAST: dict = {}     # last observation seen; logged once at exit so match logs show when we went down
+_SITREF: dict = {"bot": None}   # the live Bot, so the exit hook can print its situation counters
+
+
+def _sit_new() -> dict:
+    """Counters for the five reviewed situations. Keys starting with '_' are private working state."""
+    return {"heavy": 0, "heavy_ts": [], "engage_hp": [], "mech_taken": 0.0, "mech_dealt": 0.0,
+            "zone_taken": 0.0, "out_zone_s": 0.0, "thin_s": 0.0, "late_s": 0.0, "hold_thin_s": 0.0,
+            "min_margin": None, "pursuit_s": 0.0, "pursuit_thin_s": 0.0, "last_pursuit_t": None,
+            "fire_ticks": {}, "lane_blocked": {}, "drop_goal_s": 0.0, "drop_captured": 0, "drop_hp": [],
+            "drop_abandoned": 0,
+            "_t": None, "_win": [], "_heavy_on": False, "_last_vis_t": -99.0,
+            "_hit_t": -99.0, "_margin": None, "_next_margin_t": 0.0, "_prev_d": None, "_hp_prev": 1.0,
+            "_pending_drop": None, "_emit_t": 0.0}
+
+
+def _sit_line(s: dict) -> str:
+    out = {k: (round(v, 2) if isinstance(v, float) else v) for k, v in s.items() if not k.startswith("_")}
+    return "SITREP " + json.dumps(out, separators=(",", ":"))
 
 
 @atexit.register
 def _log_last() -> None:
     if _LAST:
         log("LAST " + " ".join(f"{k}={v}" for k, v in _LAST.items()))
+    bot = _SITREF["bot"]
+    if bot is not None and getattr(bot, "sit", None):
+        try:
+            log(_sit_line(bot.sit))
+        except Exception:
+            pass
 
 
 class Bot:
@@ -96,6 +121,16 @@ class Bot:
     COVER_END_URGENCY = 0.7    # ...and give up the spot once the zone needs us this much
     COVER_FLANK_M = 10.0     # a new spot must also be hidden from each shooter stepped this far sideways
     COVER_REPICKS = 6        # new spots per episode when the current one is seen or unreachable
+    # Decision-neutral telemetry for the five reviewed situations (SITREP line on stderr every 30 s of match
+    # time and at exit). It reads observations only and never changes an action. SURVIVOR_SITREP=0 disables it.
+    SITREP = os.environ.get("SURVIVOR_SITREP", "1") != "0"
+    SITREP_EVERY_S = 30.0
+    HEAVY_LOSS = 0.25        # "rapid armor loss": this fraction of max HP from mechs inside 3 s
+    # Zone first: when the circle needs us (urgency above this), a mortar-shell dodge may sidestep but must not
+    # point away from safety. Without it the dodge (applied twice, weight 3.0 each) outweighs the zone pull
+    # (max 3.6) and walks us back toward the closing edge. SURVIVOR_ZONEFIRST=0 restores the old arbitration.
+    ZONE_FIRST = os.environ.get("SURVIVOR_ZONEFIRST", "1") != "0"
+    ZONE_FIRST_URGENCY = 0.8
 
     def __init__(self, hello: mf.Hello):
         self.cfg = hello["config"]
@@ -104,8 +139,14 @@ class Bot:
         mech = self.cfg["mech"]
         try:  # once: the real regeneration/boost numbers, to check the cover timing assumptions
             log("CONFIG mech " + " ".join(f"{k}={v}" for k, v in sorted(mech.items())))
+            # zone phases and supply-drop numbers are not documented in this repo: print them once so the first
+            # real match settles what a drop repairs and how fast the circle closes
+            log("CONFIG zone " + json.dumps(self.cfg.get("zone"), separators=(",", ":"))[:600])
+            log("CONFIG drops " + json.dumps(self.cfg.get("drops"), separators=(",", ":"))[:300])
         except Exception:
             pass
+        self.sit = _sit_new()
+        _SITREF["bot"] = self
         self.map = None
         if Map is not None:
             try:
@@ -211,10 +252,12 @@ class Bot:
             aim_yaw, aim_pitch, fire = self._idle_aim(obs, move)
 
         # incoming mortar shell landing near us: step out of the blast
-        dodge = self._shell_dodge(obs)
-        if dodge is not None:
-            move = self._add(move, dodge, 3.0)
-            boost = boost or me["energy"] > 20
+        # (with ZONE_FIRST the dodge is applied once, below, after the zone and cover decisions)
+        if not self.ZONE_FIRST:
+            dodge = self._shell_dodge(obs)
+            if dodge is not None:
+                move = self._add(move, dodge, 3.0)
+                boost = boost or me["energy"] > 20
 
         # loot that is already within reach: take it now, whatever else we are doing
         take = self._take(obs)
@@ -239,6 +282,8 @@ class Bot:
         # Immediate blast avoidance still applies to the chosen route.
         dodge = self._shell_dodge(obs)
         if dodge is not None:
+            if self.ZONE_FIRST and urgency > self.ZONE_FIRST_URGENCY:
+                dodge = self._dodge_toward_safety(obs, dodge)
             move = self._add(move, dodge, 3.0)
             boost = boost or me["energy"] > 20
 
@@ -264,8 +309,135 @@ class Bot:
             left = BUDGET_S - (time.perf_counter() - t0)
             if left > 0.002:
                 self.field.step(left)
+        if self.SITREP:
+            try:
+                self._sitrep(obs, mode, target, fire, goal_label, hp_r)
+            except Exception as e:  # telemetry must never break a tick
+                self.SITREP = False
+                log(f"sitrep disabled after error: {e!r}")
         mf.draw.label(f"{goal_label} hp {me['hp']:.0f} z{urgency:.1f}")
         return act
+
+    # ------------------------------------------------------------------ situation telemetry (decision-neutral)
+    def _sitrep(self, obs, mode, target, fire, goal_label, hp_r) -> None:
+        """Count the five reviewed situations from this tick's observation. Never changes an action.
+
+        1 heavy armor loss from mechs (>= HEAVY_LOSS of max HP in 3 s) and armor at the next engagement;
+        2 zone: seconds with a thin departure margin (time until the closing circle excludes us minus the
+          straight-walk time to the next circle's safe area), idle while thin, zone damage, seconds outside;
+        3 pursuit: a "fight" tick walking toward a visible mech while none of our shots hit for 3 s;
+        4 lane: fire ticks, and fire ticks where the muzzle (not the eye) line is blocked, with the
+          bot's normal 3 m skip and with a 0.5 m skip (geometry right at the muzzle);
+        5 drops: seconds heading to a supply drop, captures with armor before/after, abandoned detours.
+        """
+        s, t, me = self.sit, obs["t"], obs["self"]
+        dt = 0.1 if s["_t"] is None else max(0.0, min(0.5, t - s["_t"]))
+        s["_t"] = t
+        mx = max(me.get("max_hp") or 1, 1)
+        win = s["_win"]
+        for ev in obs["events"]:
+            kind = ev.get("type")
+            if kind == "damaged":
+                amt = ev.get("amount") or 0.0
+                if ev.get("weapon") == "zone":
+                    s["zone_taken"] += amt
+                elif ev.get("by") is not None and ev.get("weapon") != "npc":
+                    s["mech_taken"] += amt
+                    win.append((t, amt))
+            elif kind == "hit" and not self._is_prop(ev.get("target")):
+                s["mech_dealt"] += ev.get("amount") or 0.0
+                s["_hit_t"] = t
+            elif kind == "drop":
+                p = s["_pending_drop"]
+                s["drop_captured"] += 1
+                s["drop_hp"].append([round(p[1], 2) if p else None, round(hp_r, 2), round(t - p[0], 1) if p else None])
+                s["_pending_drop"] = None
+        # 1: rapid armor loss
+        while win and t - win[0][0] > 3.0:
+            win.pop(0)
+        heavy = sum(a for _, a in win) >= self.HEAVY_LOSS * mx
+        if heavy and not s["_heavy_on"]:
+            s["heavy"] += 1
+            if len(s["heavy_ts"]) < 20:
+                s["heavy_ts"].append(round(t, 1))
+        s["_heavy_on"] = heavy
+        vis = any(m.get("kind") == "mech" for m in obs["mechs"])
+        if vis and t - s["_last_vis_t"] >= 6.0 and len(s["engage_hp"]) < 40:
+            s["engage_hp"].append(round(hp_r, 2))          # armor at the first sighting after >= 6 s unseen
+        if vis:
+            s["_last_vis_t"] = t
+        # 2: zone departure margin
+        if not me.get("in_zone", True):
+            s["out_zone_s"] += dt
+        zone, pos = obs["zone"], me["pos"]
+        nc, nr = zone["next_center"], zone["next_radius"]
+        d_next = math.hypot(pos[0] - nc[0], pos[1] - nc[1])
+        need = max(0.0, d_next - self._seed_radius(nr))
+        if t >= s["_next_margin_t"]:
+            s["_next_margin_t"] = t + 0.5
+            s["_margin"] = None
+            if need > 0 and t < zone["shrink_end"] + 1.0:
+                edge = None
+                for k in range(0, 121):
+                    c, r = self._zone_now(zone, t + k * 0.5)
+                    if math.hypot(pos[0] - c[0], pos[1] - c[1]) > r:
+                        edge = k * 0.5
+                        break
+                if edge is not None:
+                    speed = me["stats"].get("walk_speed", 11.7) or 11.7
+                    s["_margin"] = edge - need / speed
+        margin = s["_margin"] if need > 0 else None
+        if margin is not None:
+            if s["min_margin"] is None or margin < s["min_margin"]:
+                s["min_margin"] = round(margin, 1)
+            speed_now = math.hypot(me["vel"][0], me["vel"][1]) if me.get("vel") else 0.0
+            if margin < 3.0:
+                s["thin_s"] += dt
+                if speed_now < 1.5:
+                    s["hold_thin_s"] += dt
+                prev = s["_prev_d"]
+                if margin < 1.5 and prev is not None and dt > 0 and (prev - d_next) / dt < 4.0:
+                    s["late_s"] += dt
+        s["_prev_d"] = d_next
+        # 3: pursuit that earns nothing
+        if mode == "fight" and target is not None and target.get("kind") == "mech" and me.get("vel"):
+            dx, dy = target["pos"][0] - pos[0], target["pos"][1] - pos[1]
+            dn = math.hypot(dx, dy) or 1.0
+            if (me["vel"][0] * dx + me["vel"][1] * dy) / dn > 3.0 and t - s["_hit_t"] > 3.0:
+                s["pursuit_s"] += dt
+                s["last_pursuit_t"] = round(t, 1)
+                if margin is not None and margin < 6.0:
+                    s["pursuit_thin_s"] += dt
+        # 4: firing lane from the muzzle
+        if target is not None and any(fire):
+            for i, f in enumerate(fire):
+                w = me["weapons"][i] if f and i < len(me["weapons"]) else None
+                if w:
+                    s["fire_ticks"][w["kind"]] = s["fire_ticks"].get(w["kind"], 0) + 1
+            if self.map is not None:
+                st = me["stats"]
+                mz = (pos[0], pos[1], pos[2] + st.get("muzzle_height", 7.0))
+                tgt = (target["pos"][0], target["pos"][1], target["pos"][2] + (4.5 if target.get("kind") == "mech" else 1.75))
+                lane = s["lane_blocked"]
+                lane["n"] = lane.get("n", 0) + 1
+                if not self.map.los_fine(mz, tgt):
+                    lane["muzzle"] = lane.get("muzzle", 0) + 1
+                if not self.map.los_fine(mz, tgt, 0.5):
+                    lane["muzzle_near"] = lane.get("muzzle_near", 0) + 1
+        # 5: supply drops
+        if goal_label == "-> drop":
+            s["drop_goal_s"] += dt
+            if s["_pending_drop"] is None:
+                s["_pending_drop"] = (t, hp_r, t)
+            else:
+                s["_pending_drop"] = (s["_pending_drop"][0], s["_pending_drop"][1], t)
+        elif s["_pending_drop"] is not None and t - s["_pending_drop"][2] > 3.0:
+            s["drop_abandoned"] = s.get("drop_abandoned", 0) + 1
+            s["_pending_drop"] = None
+        _LAST["goal"] = goal_label
+        if t - s["_emit_t"] >= self.SITREP_EVERY_S:
+            s["_emit_t"] = t
+            log(_sit_line(s))
 
     # ------------------------------------------------------------------ memory
     def _remember(self, obs) -> None:
@@ -840,12 +1012,31 @@ class Bot:
             return None  # a wall in front of the tube: the blast would hit us
         return math.atan2(py - y, px - x), ang
 
+    def _dodge_toward_safety(self, obs, dodge):
+        """While the circle needs us, keep a blast dodge from pointing away from safety: drop its backward
+        component, and if almost nothing is left sidestep perpendicular to the way out instead."""
+        zp = self._zone_pull(obs)
+        n = math.hypot(*zp)
+        if n < 1e-6:
+            return dodge
+        sx, sy = zp[0] / n, zp[1] / n
+        dot = dodge[0] * sx + dodge[1] * sy
+        if dot >= 0.0:
+            return dodge
+        vx, vy = dodge[0] - dot * sx, dodge[1] - dot * sy
+        if math.hypot(vx, vy) < 0.2:
+            sign = 1.0 if (sx * dodge[1] - sy * dodge[0]) >= 0.0 else -1.0
+            return (-sy * sign, sx * sign)
+        m = math.hypot(vx, vy)
+        return (vx / m, vy / m)
+
     def _shell_dodge(self, obs):
         """Predict where visible mortar shells land; if one lands near us, return a move away from it."""
         me = obs["self"]
         x, y, z = me["pos"]
-        g = self.cfg["weapons"]["mortar"].get("gravity", 22.0)
-        radius = self.cfg["weapons"]["mortar"].get("splash_radius", 7.0) + 2.5
+        mortar = (self.cfg.get("weapons") or {}).get("mortar") or {}
+        g = mortar.get("gravity", 22.0)
+        radius = mortar.get("splash_radius", 7.0) + 2.5
         best = None
         for p in obs.get("projectiles") or []:
             if p.get("kind") != "mortar":

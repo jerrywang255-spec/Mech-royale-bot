@@ -20,6 +20,16 @@ Stderr lines (low rate): `CONFIG mech k=v …` once at start (to check the assum
 
 Tools: `scripts/exchange_sim.py` (synthetic exchange harness, not a match simulator), `scripts/bench_cover.py` (trigger-tick latency), `scripts/compare_runs.py` (paired placement comparison from a real runner).
 
+## Zone-first dodge arbitration (E009, `Bot.ZONE_FIRST`, env `SURVIVOR_ZONEFIRST=0` disables)
+
+In `act()` the mortar-shell dodge (`_shell_dodge`) is added to the move vector once, after the zone, cover and loot decisions, with weight 3.0. While `_urgency() > ZONE_FIRST_URGENCY` (0.8), `_dodge_toward_safety()` removes the dodge component that points against `_zone_pull()`'s direction (a nearly opposite dodge becomes a perpendicular sidestep). With the switch off the old behavior returns: the dodge is also added before the pickup step, so it counts twice (6.0) and can outweigh the zone pull (at most 0.6 + 3.0·urgency = 3.6). `_shell_dodge` reads `cfg.weapons.mortar` with `.get()`.
+
+## Situation telemetry (E009, `Bot.SITREP`, env `SURVIVOR_SITREP=0` disables)
+
+`_sitrep()` runs at the end of `act()` inside a `try`; it reads the observation, the chosen `mode`/`target`/`fire`/`goal_label`, and `self.cover`, and writes only `self.sit`. A `SITREP {...}` JSON line goes to stderr every 30 s of match time and at interpreter exit (after `LAST`). `CONFIG zone` and `CONFIG drops` print once at start. Keys are documented in the `_sitrep` docstring; `tests/test_sitrep.py` proves actions are identical with it off.
+
+Analysis tools (all synthetic): `scripts/zone_margin_probe.py` (does `_urgency` start before the latest straight-walk departure?), `scripts/zone_arbitration_probe.py` (does combat arbitration point away from safety outside the circle?), `scripts/lane_probe.py` (bot sight check vs exact muzzle geometry), `scripts/summarize_sim.py` (paired summary of an `exchange_sim.py --json` file).
+
 ## Files
 
 - `bot.py`: per-tick policy. Remembers observations, chooses targets/modes, selects movement and weapons, handles loot/upgrades, and performs local steering.
